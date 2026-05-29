@@ -23,7 +23,8 @@ import { annotateWithUnprunedCount, countUnprunedToolCalls } from "./src/reminde
 import { registerQueryTool } from "./src/query-tool.js";
 import { registerCommands, setPruneStatusWidget } from "./src/commands.js";
 import { formatSummaryToolCallRefs, makeSummaryDetails } from "./src/summary-refs.js";
-import type { ContextPruneConfig, CapturedBatch, IndexEntryData, PruneFrontier, FlushOptions, FlushResult, SummarizeResult } from "./src/types.js";
+import type { ContextPruneConfig, CapturedBatch, IndexEntryData, PruneFrontier, FlushOptions, FlushResult, SummarizeResult, FlushBreakdown } from "./src/types.js";
+import { formatFlushNotification } from "./src/types.js";
 import {
   DEFAULT_CONFIG,
   CONTEXT_PRUNE_TOOL_NAME,
@@ -74,11 +75,7 @@ export default function (pi: ExtensionAPI) {
   /** Whether a batch is too small to be worth an LLM summarization call. */
   const shouldSkipSmallBatch = (batch: CapturedBatch) => rawCharCount(batch) < MIN_BATCH_RAW_CHARS_TO_SUMMARIZE;
 
-  /** Format a list of turn indices for aggregate notifications. */
-  const formatTurnList = (batches: CapturedBatch[], max = 12) => {
-    const turns = batches.slice(0, max).map((b) => b.turnIndex).join(", ");
-    return batches.length > max ? `${turns}, …` : turns;
-  };
+  // ── Batch classification + result processing ───────────────────────────────
 
   /**
    * Classify batches into small (skip LLM) and summarizable (send to LLM).
@@ -119,6 +116,17 @@ export default function (pi: ExtensionAPI) {
     totalRawCharCount: number;
     totalSummaryCharCount: number;
     totalToolCallCount: number;
+    summarizedRawChars: number;
+    summarizedSummaryChars: number;
+    summarizedToolCalls: number;
+    summarizedBatchesCount: number;
+    smallRawChars: number;
+    smallToolCalls: number;
+    smallBatchesCount: number;
+    oversizedRawChars: number;
+    oversizedSummaryChars: number;
+    oversizedToolCalls: number;
+    oversizedBatchesCount: number;
     firstFailureIndex: number;
   } => {
     const processedBatches: CapturedBatch[] = [];
@@ -128,6 +136,17 @@ export default function (pi: ExtensionAPI) {
     const smallBatches: CapturedBatch[] = [];
     const oversizedBatches: CapturedBatch[] = [];
     const summarizedBatches: CapturedBatch[] = [];
+    let summarizedRawChars = 0;
+    let summarizedSummaryChars = 0;
+    let summarizedToolCalls = 0;
+    let summarizedBatchesCount = 0;
+    let smallRawChars = 0;
+    let smallToolCalls = 0;
+    let smallBatchesCount = 0;
+    let oversizedRawChars = 0;
+    let oversizedSummaryChars = 0;
+    let oversizedToolCalls = 0;
+    let oversizedBatchesCount = 0;
     let firstFailureIndex = -1;
 
     for (let i = 0; i < batches.length; i++) {
@@ -139,6 +158,9 @@ export default function (pi: ExtensionAPI) {
         totalToolCallCount += batch.toolCalls.length;
         smallBatches.push(batch);
         processedBatches.push(batch);
+        smallRawChars += batchRawCharCount;
+        smallToolCalls += batch.toolCalls.length;
+        smallBatchesCount += 1;
         continue;
       }
 
@@ -175,8 +197,16 @@ export default function (pi: ExtensionAPI) {
             persistBatchIndex(batch, appendEntry);
           }
           summarizedBatches.push(batch);
+          summarizedRawChars += batchRawCharCount;
+          summarizedSummaryChars += summaryText.length;
+          summarizedToolCalls += batch.toolCalls.length;
+          summarizedBatchesCount += 1;
         } else {
           oversizedBatches.push(batch);
+          oversizedRawChars += batchRawCharCount;
+          oversizedSummaryChars += summaryText.length;
+          oversizedToolCalls += batch.toolCalls.length;
+          oversizedBatchesCount += 1;
         }
       } catch (err) {
         if (isStaleContextError(err)) {
@@ -192,6 +222,9 @@ export default function (pi: ExtensionAPI) {
     return {
       processedBatches, smallBatches, oversizedBatches, summarizedBatches,
       totalRawCharCount, totalSummaryCharCount, totalToolCallCount, firstFailureIndex,
+      summarizedRawChars, summarizedSummaryChars, summarizedToolCalls, summarizedBatchesCount,
+      smallRawChars, smallToolCalls, smallBatchesCount,
+      oversizedRawChars, oversizedSummaryChars, oversizedToolCalls, oversizedBatchesCount,
     };
   };
 
@@ -433,21 +466,29 @@ export default function (pi: ExtensionAPI) {
 
       setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats(), getContextPercent(ctx));
 
-      if (proc.smallBatches.length > 0) {
-        safeNotify(
-          ctx,
-          `pruner: skipped ${proc.smallBatches.length} small turn(s) (${formatTurnList(proc.smallBatches)}) — raw output under ${MIN_BATCH_RAW_CHARS_TO_SUMMARIZE} chars`,
-          "info"
-        );
-      }
+      // Single unified notification with per-category breakdown
+      const breakdown = {
+        summarized: {
+          batchCount: proc.summarizedBatchesCount,
+          toolCallCount: proc.summarizedToolCalls,
+          rawCharCount: proc.summarizedRawChars,
+          summaryCharCount: proc.summarizedSummaryChars,
+        },
+        skippedSmall: {
+          batchCount: proc.smallBatchesCount,
+          toolCallCount: proc.smallToolCalls,
+          rawCharCount: proc.smallRawChars,
+          summaryCharCount: 0,
+        },
+        skippedOversized: {
+          batchCount: proc.oversizedBatchesCount,
+          toolCallCount: proc.oversizedToolCalls,
+          rawCharCount: proc.oversizedRawChars,
+          summaryCharCount: proc.oversizedSummaryChars,
+        },
+      };
 
-      if (proc.oversizedBatches.length > 0) {
-        safeNotify(
-          ctx,
-          `pruner: skipped ${proc.oversizedBatches.length} oversized turn(s) (${formatTurnList(proc.oversizedBatches)}) — summary(s) larger than raw content`,
-          "info"
-        );
-      }
+      safeNotify(ctx, formatFlushNotification(breakdown), "info");
 
       return {
         ok: true,
@@ -456,6 +497,9 @@ export default function (pi: ExtensionAPI) {
         toolCallCount: proc.totalToolCallCount,
         rawCharCount: proc.totalRawCharCount,
         summaryCharCount: proc.totalSummaryCharCount,
+        summarized: breakdown.summarized,
+        skippedSmall: breakdown.skippedSmall,
+        skippedOversized: breakdown.skippedOversized,
       };
     } catch (err) {
       restoreBatches(batches);

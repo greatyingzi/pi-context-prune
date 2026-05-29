@@ -307,12 +307,84 @@ export interface SummarizerUsage {
 
 // ── Flush result ──────────────────────────────────────────────────────────────
 
+/** Per-category breakdown of a flush operation. */
+export interface FlushBreakdown {
+  batchCount: number;
+  toolCallCount: number;
+  rawCharCount: number;
+  summaryCharCount: number;
+}
+
+/** Format a char count for display (e.g. 1.2k, 340). */
+const fmtChars = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+
+/**
+ * Builds a single compact notification text from a successful FlushResult.
+ * Shows per-category breakdown: summarized vs skipped-small vs skipped-oversized.
+ */
+export function formatFlushNotification(r: {
+  summarized: FlushBreakdown;
+  skippedSmall: FlushBreakdown;
+  skippedOversized: FlushBreakdown;
+}): string {
+  const lines: string[] = [];
+
+  const s = r.summarized;
+  if (s.toolCallCount > 0) {
+    const saved = s.rawCharCount - s.summaryCharCount;
+    const pct = s.rawCharCount > 0 ? Math.round((1 - s.summaryCharCount / s.rawCharCount) * 100) : 0;
+    lines.push(
+      `  ✓ summarized ${s.toolCallCount} call${s.toolCallCount === 1 ? "" : "s"} from ${s.batchCount} turn${s.batchCount === 1 ? "" : "s"}: ${fmtChars(s.rawCharCount)} → ${fmtChars(s.summaryCharCount)} chars (saved ${fmtChars(saved)}, ${pct}% compression)`
+    );
+  }
+
+  const sm = r.skippedSmall;
+  if (sm.toolCallCount > 0) {
+    lines.push(
+      `  ⤏ skipped ${sm.toolCallCount} small call${sm.toolCallCount === 1 ? "" : "s"} from ${sm.batchCount} turn${sm.batchCount === 1 ? "" : "s"}: ${fmtChars(sm.rawCharCount)} chars (below threshold, kept as-is)`
+    );
+  }
+
+  const ov = r.skippedOversized;
+  if (ov.toolCallCount > 0) {
+    lines.push(
+      `  ⤏ skipped ${ov.toolCallCount} oversized call${ov.toolCallCount === 1 ? "" : "s"} from ${ov.batchCount} turn${ov.batchCount === 1 ? "" : "s"}: summary ${fmtChars(ov.summaryCharCount)} chars ≥ raw ${fmtChars(ov.rawCharCount)} chars (kept as-is)`
+    );
+  }
+
+  // Overall totals
+  const totalCalls = s.toolCallCount + sm.toolCallCount + ov.toolCallCount;
+  const totalBatches = s.batchCount + sm.batchCount + ov.batchCount;
+  const totalRaw = s.rawCharCount + sm.rawCharCount + ov.rawCharCount;
+  const totalSummary = s.summaryCharCount + sm.rawCharCount + ov.rawCharCount; // non-summarized keep raw
+  const totalSaved = totalRaw - totalSummary;
+  const totalPct = totalRaw > 0 ? Math.round((totalSaved / totalRaw) * 100) : 0;
+
+  lines.push(
+    `  ── ${totalCalls} call${totalCalls === 1 ? "" : "s"} across ${totalBatches} turn${totalBatches === 1 ? "" : "s"}: ${fmtChars(totalRaw)} → ${fmtChars(totalSummary)} chars (${totalPct}% net compression)`
+  );
+
+  return `pruner: flush completed\n${lines.join("\n")}`;
+}
+
 /**
  * Result returned by `flushPending()`.
  * Single source of truth — shared by `index.ts`, `commands.ts`, and `context-prune-tool.ts`.
  */
 export type FlushResult =
-  | { ok: true; reason: "flushed" | "skipped-oversized" | "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
+  | {
+      ok: true;
+      reason: "flushed" | "skipped-oversized" | "skipped-small";
+      /** Total across all categories */
+      batchCount: number;
+      toolCallCount: number;
+      rawCharCount: number;
+      summaryCharCount: number;
+      /** Per-category breakdown */
+      summarized: FlushBreakdown;
+      skippedSmall: FlushBreakdown;
+      skippedOversized: FlushBreakdown;
+    }
   | { ok: false; reason: "empty" | "already-flushing" | "summarizer-failed" | "stale-context" | "failed" | "aborted"; error?: string };
 
 // ── Prune frontier ────────────────────────────────────────────────────────────

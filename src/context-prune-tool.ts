@@ -113,7 +113,7 @@ export function registerContextPruneTool(
           content: [
             {
               type: "text",
-              text: `Context prune completed. Summarized ${result.toolCallCount} tool call${result.toolCallCount === 1 ? "" : "s"} from ${result.batchCount} batch${result.batchCount === 1 ? "" : "es"}. Summary size: ${result.summaryCharCount} chars vs ${result.rawCharCount} raw chars. Use context_tree_query with the short refs from the summary to retrieve full outputs if needed.`,
+              text: `Context prune completed. Summarized ${result.summarized.toolCallCount} tool call${result.summarized.toolCallCount === 1 ? "" : "s"} from ${result.summarized.batchCount} turn${result.summarized.batchCount === 1 ? "" : "s"}: ${result.summarized.rawCharCount} → ${result.summarized.summaryCharCount} chars. Use context_tree_query with the short refs from the summary to retrieve full outputs if needed.`,
             },
           ],
           details: result,

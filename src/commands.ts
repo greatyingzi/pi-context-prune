@@ -4,12 +4,14 @@ import {
   type CapturedBatch,
   type FlushOptions,
   type FlushResult,
+  type FlushBreakdown,
   PRUNE_ON_MODES,
   BATCHING_MODES,
   STATUS_WIDGET_ID,
   PROGRESS_WIDGET_ID,
   SUMMARIZER_THINKING_LEVELS,
 } from "./types.js";
+import { formatFlushNotification } from "./types.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { saveConfig } from "./config.js";
 import { formatTokens, formatCost, formatCharProgress } from "./stats.js";
@@ -759,24 +761,13 @@ export function registerCommands(
             break;
           }
 
-          if (result.reason === "skipped-oversized") {
-            ctx.ui.notify(
-              `pruner: skipped pruning ${result.toolCallCount} tool call${result.toolCallCount === 1 ? "" : "s"} — summary was ${result.summaryCharCount} chars vs ${result.rawCharCount} raw chars; frontier advanced past this range`,
-              "info"
-            );
-            break;
-          }
-
-          if (result.reason === "skipped-small") {
-            ctx.ui.notify(
-              `pruner: skipped ${result.toolCallCount} small tool call${result.toolCallCount === 1 ? "" : "s"} from ${result.batchCount} batch${result.batchCount === 1 ? "" : "es"} — raw output ${result.rawCharCount} chars was below the summarization threshold; frontier advanced past this range`,
-              "info"
-            );
-            break;
-          }
-
+          // Show compact flush summary with per-category breakdown
           ctx.ui.notify(
-            `pruner: pruned ${result.toolCallCount} tool call${result.toolCallCount === 1 ? "" : "s"} from ${result.batchCount} batch${result.batchCount === 1 ? "" : "es"} — summary ${result.summaryCharCount} chars vs ${result.rawCharCount} raw chars`,
+            formatFlushNotification({
+              summarized: result.summarized,
+              skippedSmall: result.skippedSmall,
+              skippedOversized: result.skippedOversized,
+            }),
             "info"
           );
           break;
