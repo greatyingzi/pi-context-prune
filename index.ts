@@ -823,7 +823,7 @@ export default function (pi: ExtensionAPI) {
         case "scan": setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — scanning…"); break;
         case "code": setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — code detection…"); break;
         case "llm":  setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — LLM evaluating…"); break;
-        case "done": setPruneStatusWidget(ctx, currentConfig.value, getStats()); break;
+        case "done": break;
       }
     });
   };

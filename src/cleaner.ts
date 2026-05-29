@@ -13,8 +13,8 @@ import type { CapturedBatch, ContextPruneConfig } from "./types.js";
 import type { ToolCallIndexer } from "./indexer.js";
 import { detectDiscardableReads } from "./batch-capture.js";
 
-/** Max toolResults to send to LLM for evaluation at once. */
-const MAX_EVAL_BATCH = 60;
+/** Max toolResults per LLM evaluation call. If more remain, split into batches. */
+const MAX_EVAL_PER_CALL = 40;
 
 /** Max chars of result text to include in the evaluation prompt. */
 const RESULT_PREVIEW_LENGTH = 200;
@@ -168,51 +168,60 @@ export async function cleanToolResults(
   const recentThreshold = Math.max(maxTurn - 10, 0);
 
   // Filter out very recent results (don't waste LLM tokens evaluating them)
-  const llmCandidates = remaining.filter((c) => c.turnIndex <= recentThreshold).slice(0, MAX_EVAL_BATCH);
+  const llmCandidates = remaining.filter((c) => c.turnIndex <= recentThreshold);
 
   if (llmCandidates.length === 0) {
+    onPhase?.("done");
     return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
   }
 
-  // Build evaluation prompt
-  const lines = llmCandidates.map((c, i) =>
-    `${i + 1}. [${c.toolCallId}] turn ${c.turnIndex}: ${c.toolName}(${c.argsPreview})\n   Preview: ${c.resultPreview}`
-  );
+  // Build file edit history for LLM context
+  const editHistory = buildEditHistory(candidates);
 
-  const editLines = editHistory.length > 0
-    ? `\n\nFile edit history (these files were modified):\n${editHistory.map((e) => `  - turn ${e.turnIndex}: ${e.toolName} ${e.path}`).join("\n")}`
-    : "";
+  // Process in batches to avoid oversized prompts
+  let llmRemoved = 0;
+  for (let offset = 0; offset < llmCandidates.length; offset += MAX_EVAL_PER_CALL) {
+    const batch = llmCandidates.slice(offset, offset + MAX_EVAL_PER_CALL);
+    const batchNum = Math.floor(offset / MAX_EVAL_PER_CALL) + 1;
+    const totalBatches = Math.ceil(llmCandidates.length / MAX_EVAL_PER_CALL);
+    onPhase?.("llm");
 
-  const userMessage = `Current turn is ~${maxTurn}. Evaluate these ${llmCandidates.length} tool results from earlier turns.${editLines}\n\nWhich can be safely removed?\n\n${lines.join("\n\n")}`;
+    const lines = batch.map((c, i) =>
+      `${offset + i + 1}. [${c.toolCallId}] turn ${c.turnIndex}: ${c.toolName}(${c.argsPreview})\n   Preview: ${c.resultPreview}`
+    );
 
-  try {
-    const model = ctx.model;
-    const response = await model.complete([
-      { role: "system", content: EVAL_SYSTEM_PROMPT },
-      { role: "user", content: userMessage },
-    ]);
+    const editLines = editHistory.length > 0
+      ? `\n\nFile edit history (these files were modified):\n${editHistory.map((e) => `  - turn ${e.turnIndex}: ${e.toolName} ${e.path}`).join("\n")}`
+      : "";
 
-    const text = typeof response === "string" ? response : (response as any).content ?? "";
-    const parsed = tryParseJson(text);
+    const userMessage = `Current turn is ~${maxTurn}. Evaluating batch ${batchNum}/${totalBatches} (${batch.length} results).${editLines}\n\nWhich can be safely removed?\n\n${lines.join("\n\n")}`;
 
-    if (!parsed || !Array.isArray(parsed.removeIds)) {
-      return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
-    }
+    try {
+      const model = ctx.model;
+      const response = await model.complete([
+        { role: "system", content: EVAL_SYSTEM_PROMPT },
+        { role: "user", content: userMessage },
+      ]);
 
-    const removeSet = new Set(parsed.removeIds);
-    let llmRemoved = 0;
+      const text = typeof response === "string" ? response : (response as any).content ?? "";
+      const parsed = tryParseJson(text);
 
-    for (const candidate of llmCandidates) {
-      if (removeSet.has(candidate.toolCallId)) {
-        addToIndexer(indexer, candidate);
-        llmRemoved++;
+      if (parsed && Array.isArray(parsed.removeIds)) {
+        const removeSet = new Set(parsed.removeIds);
+        for (const candidate of batch) {
+          if (removeSet.has(candidate.toolCallId)) {
+            addToIndexer(indexer, candidate);
+            llmRemoved++;
+          }
+        }
       }
+    } catch {
+      // Continue with next batch even if this one fails
     }
-
-    return { evaluated: candidates.length, codeRemoved, llmRemoved };
-  } catch {
-    return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
   }
+
+  onPhase?.("done");
+  return { evaluated: candidates.length, codeRemoved, llmRemoved };
 }
 
 /** Add a tool result to the indexer as "summarized" (marks it for pruning). */
