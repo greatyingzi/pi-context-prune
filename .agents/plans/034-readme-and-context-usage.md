@@ -12,7 +12,7 @@ steps:
       - "- [x] step 4: show context usage after pruning in notification"
   - phase: validation
     steps:
-      - "- [ ] step 5: brace balance + commit + push"
+      - "- [x] step 5: brace balance + commit + push"
 ---
 
 # 034 — README update + context usage tracking
@@ -26,4 +26,4 @@ steps:
 - [x] step 4: show context usage after pruning in notification
 
 ## Phase 3 — Validation
-- [ ] step 5: brace balance + commit + push
+- [x] step 5: brace balance + commit + push
