@@ -12,6 +12,7 @@
  */
 
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { stream } from "@mariozechner/pi-ai";
 import type { FileKnowledge, KnowledgeGraphMap, ContextPruneConfig } from "./types.js";
 import { KnowledgeGraph } from "./knowledge-graph.js";
 
@@ -20,31 +21,46 @@ import { KnowledgeGraph } from "./knowledge-graph.js";
 /** Extract candidate keywords from user prompt. */
 export function extractKeywords(prompt: string): string[] {
   const keywords: string[] = [];
-  const lower = prompt.toLowerCase();
 
-  // 1. Quoted strings: "src/foo.ts" or 'validateEmail'
+  // 1. Quoted strings: "src/foo.ts" or 'validateEmail' or `template`
   const quoted = prompt.match(/['"`]([^'"`]+)['"`]/g) ?? [];
   for (const q of quoted) {
     keywords.push(q.slice(1, -1));
   }
 
-  // 2. File paths: src/foo.ts, ./bar/baz.ts
-  const paths = prompt.match(/(?:src\/|\.\/|~\/)?[\w-]+(?:\/[\w-]+)*\.\w+/g) ?? [];
+  // 2. File paths: src/foo.ts, ./bar/baz.ts, ~/config.rs
+  const paths = prompt.match(/(?:src\/|\.\.?\/|~\/)[\w.-]+(?:\/[\w.-]+)*/g) ?? [];
   keywords.push(...paths);
 
-  // 3. CamelCase/PascalCase identifiers (2+ chars): validateEmail, FooBar
-  const identifiers = prompt.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b|\b[a-z]+(?:[A-Z][a-z]+)+\b/g) ?? [];
-  keywords.push(...identifiers);
+  // 3. CamelCase/PascalCase identifiers (2+ segments): validateEmail, FooBar
+  const camel = prompt.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b|\b[a-z]+(?:[A-Z][a-z]+)+\b/g) ?? [];
+  keywords.push(...camel);
 
   // 4. snake_case identifiers: parse_config, MIN_BATCH
   const snake = prompt.match(/\b[a-z]+(?:_[a-z]+)+\b|\b[A-Z]+(?:_[A-Z]+)+\b/gi) ?? [];
   keywords.push(...snake);
 
-  // 5. Common action words (Chinese + English) — don't add as keywords but
-  //    extract nouns near them for context
-  //    "修复 validateEmail 的 bug" → validateEmail already captured above
+  // 5. kebab-case identifiers: my-component, foo-bar
+  const kebab = prompt.match(/\b[a-z]+(?:-[a-z]+){1,}\b/g) ?? [];
+  keywords.push(...kebab);
 
-  // Deduplicate and lowercase for matching
+  // 6. $variable — dollar-sign prefixed variables
+  const dollar = prompt.match(/\$([a-zA-Z_]\w{1,})/g) ?? [];
+  keywords.push(...dollar);
+
+  // 7. <Component /> JSX / HTML tag names (capture just the name)
+  const jsx = prompt.match(/<([A-Z][a-zA-Z0-9]+)(?:\s|\/|>)/g) ?? [];
+  for (const tag of jsx) {
+    keywords.push(tag.slice(1).replace(/[\s\/>,].*$/, ""));
+  }
+
+  // 8. #[...] macro / attribute patterns (Rust, etc.)
+  const macro = prompt.match(/#\[([\w()]+)\]/g) ?? [];
+  for (const m of macro) {
+    keywords.push(m);
+  }
+
+  // Deduplicate
   return [...new Set(keywords.filter((k) => k.length >= 2))];
 }
 
@@ -61,13 +77,28 @@ export function fuzzyMatchGraph(
     let score = 0;
     const matchedBy: string[] = [];
 
+    // Pre-compute path segments for segment-level matching
+    const pathSegments = entry.path.toLowerCase().split(/[\/\\.]/);
+
     for (const kw of keywords) {
       const kwLower = kw.toLowerCase();
 
-      // Path match (highest weight — if user mentions a file, it's very relevant)
-      if (entry.path.toLowerCase().includes(kwLower) || kwLower.includes(entry.path.toLowerCase())) {
-        score += 10;
-        matchedBy.push(`path:${kw}`);
+      // Path segment match (high weight — keyword matches a path segment exactly)
+      for (const seg of pathSegments) {
+        if (seg === kwLower) {
+          score += 12;
+          matchedBy.push(`path-segment:${kw}`);
+          break;
+        }
+      }
+
+      // Path prefix/suffix match (medium-high weight)
+      if (entry.path.toLowerCase().endsWith(kwLower) || entry.path.toLowerCase().includes(kwLower)) {
+        // But only if the keyword looks like a file path (contains / or .)
+        if (kw.includes("/") || kw.includes(".")) {
+          score += 8;
+          matchedBy.push(`path:${kw}`);
+        }
       }
 
       // Export match (high weight — user asks about a function/class by name)
@@ -75,7 +106,7 @@ export function fuzzyMatchGraph(
         if (exp.toLowerCase() === kwLower || exp.toLowerCase().includes(kwLower)) {
           score += 8;
           matchedBy.push(`export:${exp}`);
-          break; // one match per keyword per category
+          break;
         }
       }
 
@@ -167,12 +198,35 @@ export async function selectRelevantKnowledge(
   const prompt = `${SELECTION_PROMPT}\n\nUser message:\n${userPrompt}\n\nCandidates:\n${candidateText}`;
 
   try {
-    const result = await ctx.model.complete(prompt, {
-      maxTokens: 200,
-      temperature: 0,
-    });
+    // Use stream() like the summarizer does — ensures provider options work
+    const auth = ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+    const responseStream = stream(
+      ctx.model,
+      {
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: prompt }],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        // Limit output size — we just need a small JSON array
+        maxTokens: 200,
+      }
+    );
 
-    const text = typeof result === "string" ? result : (result as any).text ?? "";
+    // Consume stream
+    for await (const _event of responseStream) {
+      // Just consume — we get the final result below
+    }
+
+    const response = await responseStream.result();
+    const text = typeof response === "string" ? response : response.text ?? "";
+
     // Parse JSON response
     const jsonMatch = text.match(/\{[\s\S]*"selected"[\s\S]*\}/);
     if (!jsonMatch) return candidates.slice(0, 3).map((c) => c.entry);
@@ -192,24 +246,31 @@ export async function selectRelevantKnowledge(
 // ── Serialization for injection ─────────────────────────────────────────────
 
 /** Serialize selected knowledge entries for context injection. */
-export function serializeForInjection(entries: Array<FileKnowledge>): string {
+export function serializeForInjection(
+  entries: Array<FileKnowledge>,
+  pathsWithActiveSummary?: Set<string>
+): string {
   if (entries.length === 0) return "";
 
   const sections: string[] = ["<relevant-knowledge>"];
 
   for (const entry of entries) {
+    // Skip files that already have an unpruned summary in context
+    if (pathsWithActiveSummary?.has(entry.path)) continue;
+
     const parts: string[] = [];
     if (entry.exports.length > 0) {
       parts.push(`  exports: ${entry.exports.join(", ")}`);
     }
     if (entry.imports.length > 0) {
-      parts.push(`  imports: ${entry.imports.slice(-5).join("; ")}`);
+      parts.push(`  imports: ${entry.imports.slice(-3).join("; ")}`);
     }
     if (entry.structure.length > 0) {
       parts.push(`  structure:\n    ${entry.structure.slice(-5).join("\n    ")}`);
     }
     if (entry.changes.length > 0) {
-      parts.push(`  changes: ${entry.changes.join("; ")}`);
+      // Cap changes at last 3
+      parts.push(`  changes: ${entry.changes.slice(-3).join("; ")}`);
     }
 
     if (parts.length > 0) {
@@ -219,5 +280,8 @@ export function serializeForInjection(entries: Array<FileKnowledge>): string {
   }
 
   sections.push("</relevant-knowledge>");
+
+  // If all entries were skipped, return empty
+  if (sections.length <= 2) return "";
   return sections.join("\n");
 }

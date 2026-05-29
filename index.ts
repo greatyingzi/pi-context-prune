@@ -837,7 +837,12 @@ export default function (pi: ExtensionAPI) {
                 const selected = await selectRelevantKnowledge(
                   candidates, userText, currentConfig.value, ctx
                 );
-                const knowledgeText = serializeForInjection(selected);
+                // Build set of file paths that already have unpruned summaries in context
+                const pathsWithActiveSummary = new Set<string>();
+                for (const record of indexer.getIndex().values()) {
+                  if (record.filePath) pathsWithActiveSummary.add(record.filePath);
+                }
+                const knowledgeText = serializeForInjection(selected, pathsWithActiveSummary);
                 if (knowledgeText) {
                   // Inject as a pseudo-toolResult attached to the conversation
                   // so it's visible to the main LLM without breaking role alternation
