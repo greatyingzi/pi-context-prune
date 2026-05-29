@@ -806,23 +806,61 @@ export default function (pi: ExtensionAPI) {
   registerContextPruneTool(pi, (ctx, options) => flushPending(ctx, { delivery: "runtime", ...options }));
 
   // ── Register /pruner command + summary message renderer ────────────
+  /**
+   * Build ALL batches (indexed + unindexed) for accurate stale-read detection.
+   * Fix #1: detectDiscardableReads needs full history to know which read is "latest".
+   */
+  const buildAllBatches = (branch: any[], idx: ToolCallIndexer): CapturedBatch[] => {
+    // Get unindexed batches from session
+    const unindexed = captureUnindexedBatchesFromSession(branch, idx);
+
+    // Reconstruct indexed batches from indexer records
+    const indexedByTurn = new Map<number, CapturedBatch>();
+    for (const [_id, record] of idx.getIndex()) {
+      if (!indexedByTurn.has(record.turnIndex)) {
+        indexedByTurn.set(record.turnIndex, {
+          turnIndex: record.turnIndex,
+          timestamp: record.timestamp,
+          assistantText: "",
+          toolCalls: [],
+        });
+      }
+      indexedByTurn.get(record.turnIndex)!.toolCalls.push({
+        toolCallId: record.toolCallId,
+        toolName: record.toolName,
+        args: record.args,
+        resultText: record.resultText,
+        isError: record.isError,
+      });
+    }
+
+    const indexed = [...indexedByTurn.values()];
+
+    // Merge and sort by turnIndex
+    return [...indexed, ...unindexed].sort((a, b) => a.turnIndex - b.turnIndex);
+  };
+
   // ── /pruner clean handler ──────────────────────────────────────────────────
   const cleanToolResultsWrapper = async (ctx: any): Promise<{ evaluated: number; codeRemoved: number; llmRemoved: number }> => {
-    // Get ALL messages from session branch (toolResults + summaries)
     const branch = ctx.sessionManager.getBranch();
+
+    // Collect ALL messages (toolResult + summary) for candidate scanning
     const messages: any[] = [];
     for (const entry of branch) {
       if (entry.type === "message") {
         const msg = entry.message;
-        // Include toolResult messages and summary messages
         if (msg.role === "toolResult" || msg.customType === CUSTOM_TYPE_SUMMARY) {
           messages.push(msg);
         }
       }
     }
-    // Build pseudo-batches for code-based detection
-    const batches = captureUnindexedBatchesFromSession(branch, indexer);
-    return doCleanToolResults(messages, batches, indexer, currentConfig.value, ctx, (phase) => {
+
+    // Fix #1: build ALL batches (indexed + unindexed) for accurate read ordering
+    // captureUnindexedBatchesFromSession only returns unindexed, so we also
+    // reconstruct indexed batches from the indexer records
+    const allBatches = buildAllBatches(branch, indexer);
+
+    return doCleanToolResults(messages, allBatches, indexer, currentConfig.value, ctx, (phase) => {
       switch (phase) {
         case "scan": setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — scanning…"); break;
         case "code": setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — code detection…"); break;

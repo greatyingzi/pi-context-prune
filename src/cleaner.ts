@@ -2,9 +2,9 @@
  * `/pruner clean` — hybrid stale tool result + summary removal.
  *
  * Phase 1 (code-based, deterministic):
- *   - Detect stale/duplicate file reads via detectDiscardableReads()
- *   - Detect stale summaries (reads of files later edited) via indexer
- *   - Detect stale summary messages in context (old read summaries for edited files)
+ *   - Detect stale/duplicate file reads via detectDiscardableReads() (ALL batches, not just unindexed)
+ *   - Detect stale summaries via indexer + context scan
+ *   - Collect edited files from BOTH indexer records AND unflushed messages
  *
  * Phase 2 (LLM-evaluated): for remaining results, ask the LLM which are stale.
  *
@@ -12,7 +12,7 @@
  */
 
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { CapturedBatch, ContextPruneConfig } from "./types.js";
+import type { CapturedBatch, ContextPruneConfig, ToolCallRecord } from "./types.js";
 import type { ToolCallIndexer } from "./indexer.js";
 import { CUSTOM_TYPE_SUMMARY } from "./types.js";
 import { detectDiscardableReads } from "./batch-capture.js";
@@ -61,8 +61,11 @@ interface ToolResultInfo {
   argsPreview: string;
   turnIndex: number;
   resultPreview: string;
+  resultFullText: string;
   filePath?: string;
   isSummary?: boolean;
+  /** For summary removal: the message content to preserve in indexer for recovery. */
+  summaryContent?: string;
 }
 
 /** Extract file path from tool call args if applicable. */
@@ -93,10 +96,17 @@ function truncate(text: string, maxLen: number): string {
 /**
  * Hybrid stale content removal: code-based detection + LLM evaluation.
  * Handles both raw toolResults AND summary messages.
+ *
+ * @param messages     All messages from the session branch (toolResult + summary)
+ * @param allBatches   ALL batches (indexed + unindexed) for accurate read/edit ordering
+ * @param indexer      The tool call indexer
+ * @param config       Current pruner config
+ * @param ctx          Extension context
+ * @param onPhase      Optional phase callback for UI updates
  */
 export async function cleanToolResults(
   messages: any[],
-  batches: CapturedBatch[],
+  allBatches: CapturedBatch[],
   indexer: ToolCallIndexer,
   config: ContextPruneConfig,
   ctx: ExtensionContext,
@@ -104,7 +114,30 @@ export async function cleanToolResults(
 ): Promise<{ evaluated: number; codeRemoved: number; llmRemoved: number }> {
   onPhase?.("scan");
 
-  // Collect unindexed toolResults AND summary messages
+  // ── Collect edited file paths from ALL sources ──────────────────────
+  // Fix #3: include both indexer records AND unflushed messages
+  const editedFilePaths = new Set<string>();
+
+  // From indexer (already flushed edits)
+  for (const [_id, record] of indexer.getIndex()) {
+    if ((record.toolName === "edit" || record.toolName === "write") && record.filePath) {
+      editedFilePaths.add(record.filePath);
+    }
+  }
+
+  // From messages (unflushed edits still in context)
+  for (const msg of messages) {
+    if (msg.role === "toolResult") {
+      const toolName = msg.toolName ?? "";
+      const args = msg.args ?? msg.input ?? {};
+      if ((toolName === "edit" || toolName === "write")) {
+        const path = filePathFromArgs(toolName, args);
+        if (path) editedFilePaths.add(path);
+      }
+    }
+  }
+
+  // ── Collect candidates ──────────────────────────────────────────────
   const candidates: ToolResultInfo[] = [];
   const maxTurn = Math.max(...messages.map((m: any) => m.turnIndex ?? 0), 0);
 
@@ -114,11 +147,7 @@ export async function cleanToolResults(
       const toolName = msg.toolName ?? "unknown";
       const args = msg.args ?? msg.input ?? {};
       const turnIndex = msg.turnIndex ?? -1;
-      const resultText = typeof msg.content === "string"
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map((c: any) => c.text ?? "").join("")
-          : "";
+      const resultText = extractText(msg.content);
 
       candidates.push({
         toolCallId: msg.toolCallId,
@@ -126,30 +155,39 @@ export async function cleanToolResults(
         argsPreview: argsPreview(args),
         turnIndex,
         resultPreview: truncate(resultText, RESULT_PREVIEW_LENGTH),
+        resultFullText: resultText,
         filePath: filePathFromArgs(toolName, args),
       });
     }
 
-    // Summary messages — check if they're stale
+    // Summary messages — check if they reference stale reads
     if (msg.customType === CUSTOM_TYPE_SUMMARY && msg.details?.toolCallRefs) {
       const refs: Array<{ toolCallId: string }> = msg.details.toolCallRefs;
       const toolNames: string[] = msg.details.toolNames ?? [];
       const turnIndex: number = msg.details.turnIndex ?? msg.turnIndex ?? -1;
-      const content: string = typeof msg.content === "string"
-        ? msg.content
-        : "";
+      const content: string = extractText(msg.content);
 
-      // Create a pseudo-candidate for each summary
-      for (const ref of refs) {
-        if (indexer.isStale(ref.toolCallId)) {
-          // This summary references a stale read — remove it via code detection
+      // Extract file paths from tool names in the summary
+      const summaryFilePaths = refs
+        .map((ref) => indexer.getIndex().get(ref.toolCallId)?.filePath)
+        .filter(Boolean) as string[];
+
+      // Check if ANY referenced file was later edited
+      const hasStaleRef = summaryFilePaths.some((p) => editedFilePaths.has(p));
+
+      if (hasStaleRef) {
+        // Create pseudo-candidates for the stale summary
+        for (const ref of refs) {
           candidates.push({
             toolCallId: ref.toolCallId,
             toolName: "summary",
             argsPreview: `summary of ${toolNames.join(", ")}`,
             turnIndex,
             resultPreview: truncate(content, RESULT_PREVIEW_LENGTH),
+            resultFullText: content,
             isSummary: true,
+            summaryContent: content,
+            filePath: indexer.getIndex().get(ref.toolCallId)?.filePath,
           });
         }
       }
@@ -164,20 +202,12 @@ export async function cleanToolResults(
   // ── Phase 1: Code-based detection (deterministic, zero cost) ──────────
   onPhase?.("code");
 
-  // 1a. Detect stale/duplicate reads using the same logic as flushPending
-  const discardableIds = detectDiscardableReads(batches);
+  // Fix #1: detectDiscardableReads uses ALL batches for accurate ordering
+  const discardableIds = detectDiscardableReads(allBatches);
 
-  // 1b. Detect stale records using indexer history (reads before edits)
+  // Fix #2: detect stale records from indexer
   indexer.detectStaleRecords();
   const staleIds = indexer.getStaleIds();
-
-  // 1c. Collect file paths that were edited (for stale summary detection)
-  const editedFilePaths = new Set<string>();
-  for (const [_id, record] of indexer.getIndex()) {
-    if ((record.toolName === "edit" || record.toolName === "write") && record.filePath) {
-      editedFilePaths.add(record.filePath);
-    }
-  }
 
   let codeRemoved = 0;
   const remaining: ToolResultInfo[] = [];
@@ -185,23 +215,19 @@ export async function cleanToolResults(
   for (const candidate of candidates) {
     let shouldRemove = false;
 
-    // Code-detection: discardable reads
+    // Code-detection: discardable reads (from all-batch analysis)
     if (discardableIds.has(candidate.toolCallId)) {
       shouldRemove = true;
     }
 
-    // Code-detection: stale indexer records
+    // Code-detection: stale indexer records (reads before edits)
     if (staleIds.has(candidate.toolCallId)) {
       shouldRemove = true;
     }
 
-    // Code-detection: stale summary (read of file that was later edited)
-    if (candidate.isSummary && candidate.filePath && editedFilePaths.has(candidate.filePath)) {
-      shouldRemove = true;
-    }
-
-    // Code-detection: summary for an already-stale toolCallId
-    if (candidate.isSummary && staleIds.has(candidate.toolCallId)) {
+    // Code-detection: stale summary (references a file that was later edited)
+    if (candidate.isSummary) {
+      // Already filtered above — all summary candidates here are stale
       shouldRemove = true;
     }
 
@@ -209,7 +235,6 @@ export async function cleanToolResults(
       addToIndexer(indexer, candidate);
       codeRemoved++;
     } else if (!candidate.isSummary) {
-      // Don't send summary pseudo-candidates to LLM (they're handled by code)
       remaining.push(candidate);
     }
   }
@@ -217,11 +242,8 @@ export async function cleanToolResults(
   // ── Phase 2: LLM evaluation for remaining results ─────────────────────
   onPhase?.("llm");
 
-  // Build file edit history for LLM context
-  const editHistory = buildEditHistory(candidates);
+  const editHistory = buildEditHistory(messages, indexer);
   const recentThreshold = Math.max(maxTurn - 10, 0);
-
-  // Filter out very recent results
   const llmCandidates = remaining.filter((c) => c.turnIndex <= recentThreshold);
 
   if (llmCandidates.length === 0) {
@@ -229,7 +251,6 @@ export async function cleanToolResults(
     return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
   }
 
-  // Process in batches
   let llmRemoved = 0;
   for (let offset = 0; offset < llmCandidates.length; offset += MAX_EVAL_PER_CALL) {
     const batch = llmCandidates.slice(offset, offset + MAX_EVAL_PER_CALL);
@@ -273,13 +294,29 @@ export async function cleanToolResults(
   return { evaluated: candidates.length, codeRemoved, llmRemoved };
 }
 
-/** Add a tool result to the indexer as "summarized" (marks it for pruning). */
+/** Extract text content from message content (string or array of blocks). */
+function extractText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((c: any) => c.text ?? "").join("");
+  return "";
+}
+
+/**
+ * Add a tool result to the indexer.
+ * Fix #2: preserve original content for context_tree_query recovery.
+ */
 function addToIndexer(indexer: ToolCallIndexer, info: ToolResultInfo): void {
+  // For summary removals, store the summary content so context_tree_query
+  // can recover it. For raw toolResults, store the full result text.
+  const preservedText = info.isSummary
+    ? (info.summaryContent ?? info.resultFullText)
+    : info.resultFullText;
+
   indexer.getIndex().set(info.toolCallId, {
     toolCallId: info.toolCallId,
     toolName: info.toolName,
     args: {},
-    resultText: "",
+    resultText: preservedText,
     isError: false,
     turnIndex: info.turnIndex,
     timestamp: 0,
@@ -287,11 +324,48 @@ function addToIndexer(indexer: ToolCallIndexer, info: ToolResultInfo): void {
   });
 }
 
-/** Build a list of file edit operations for LLM context. */
-function buildEditHistory(candidates: ToolResultInfo[]): Array<{ toolName: string; path: string; turnIndex: number }> {
-  return candidates
-    .filter((c) => (c.toolName === "edit" || c.toolName === "write") && c.filePath)
-    .map((c) => ({ toolName: c.toolName, path: c.filePath!, turnIndex: c.turnIndex }));
+/**
+ * Build edit history from BOTH indexer records and unindexed messages.
+ * Fix #3: complete edit history for LLM context.
+ */
+function buildEditHistory(
+  messages: any[],
+  indexer: ToolCallIndexer,
+): Array<{ toolName: string; path: string; turnIndex: number }> {
+  const edits: Array<{ toolName: string; path: string; turnIndex: number }> = [];
+  const seen = new Set<string>();
+
+  // From indexer
+  for (const [_id, record] of indexer.getIndex()) {
+    if ((record.toolName === "edit" || record.toolName === "write") && record.filePath) {
+      const key = `${record.filePath}:${record.turnIndex}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        edits.push({ toolName: record.toolName, path: record.filePath, turnIndex: record.turnIndex });
+      }
+    }
+  }
+
+  // From messages (unflushed)
+  for (const msg of messages) {
+    if (msg.role === "toolResult") {
+      const toolName = msg.toolName ?? "";
+      if (toolName === "edit" || toolName === "write") {
+        const args = msg.args ?? msg.input ?? {};
+        const path = filePathFromArgs(toolName, args);
+        const turnIndex = msg.turnIndex ?? -1;
+        if (path) {
+          const key = `${path}:${turnIndex}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            edits.push({ toolName, path, turnIndex });
+          }
+        }
+      }
+    }
+  }
+
+  return edits.sort((a, b) => a.turnIndex - b.turnIndex);
 }
 
 /** Try to parse JSON from LLM response, handling markdown fences. */
