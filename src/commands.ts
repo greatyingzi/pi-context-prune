@@ -87,6 +87,7 @@ const SUBCOMMANDS = [
   { value: "batching", label: "batching  — show or set the batching mode (turn / agent-message)" },
   { value: "stats",   label: "stats     — show cumulative summarizer token/cost stats" },
   { value: "tree",    label: "tree      — browse pruned tool calls in a foldable tree" },
+  { value: "clean",   label: "clean     — LLM-evaluated stale content removal from context" },
   { value: "now",     label: "now       — flush pending tool calls immediately (widget progress)" },
   { value: "help",    label: "help      — show this help" },
 ] as const;
@@ -357,6 +358,7 @@ export function registerCommands(
   syncToolActivation: () => void,
   getStats: () => SummarizerStats,
   indexer: ToolCallIndexer,
+  cleanToolResults: (ctx: ExtensionCommandContext) => Promise<{ evaluated: number; removed: number }>,
 ): void {
   // Register the /pruner command
   pi.registerCommand("pruner", {
@@ -715,6 +717,31 @@ export function registerCommands(
           }
           saveConfig(currentConfig.value);
           ctx.ui.notify(`Batching mode set to: ${batchingModeLabel(currentConfig.value.batchingMode)}`);
+          break;
+        }
+
+        // ── /pruner clean ──
+        case "clean": {
+          if (!currentConfig.value.enabled) {
+            ctx.ui.notify("Context pruning is disabled. Run /pruner on first.", "warning");
+            break;
+          }
+          ctx.ui.notify("pruner: evaluating stale content…", "info");
+          try {
+            const result = await cleanToolResults(ctx);
+            if (result.evaluated === 0) {
+              ctx.ui.notify("pruner: no unprocessed tool results found in context — nothing to clean.", "info");
+            } else if (result.removed === 0) {
+              ctx.ui.notify(`pruner: evaluated ${result.evaluated} tool results — nothing stale enough to remove.`, "info");
+            } else {
+              ctx.ui.notify(
+                `pruner: clean completed\n  ✓ evaluated ${result.evaluated} tool results\n  ✕ removed ${result.removed} stale result${result.removed === 1 ? "" : "s"} from context\n  Removal takes effect on the next LLM request.`,
+                "info"
+              );
+            }
+          } catch (err: any) {
+            ctx.ui.notify(`pruner: clean failed — ${err.message ?? err}`, "error");
+          }
           break;
         }
 

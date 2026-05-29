@@ -16,6 +16,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./src/config.js";
 import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode, detectDiscardableReads } from "./src/batch-capture.js";
+import { cleanToolResults as doCleanToolResults } from "./src/cleaner.js";
 import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
 import { ToolCallIndexer } from "./src/indexer.js";
 import { pruneMessages } from "./src/pruner.js";
@@ -805,5 +806,19 @@ export default function (pi: ExtensionAPI) {
   registerContextPruneTool(pi, (ctx, options) => flushPending(ctx, { delivery: "runtime", ...options }));
 
   // ── Register /pruner command + summary message renderer ────────────
-  registerCommands(pi, currentConfig, flushPending, capturePendingBatches, syncToolActivation, () => statsAccum.getStats(), indexer);
+  // ── /pruner clean handler ──────────────────────────────────────────────────
+  const cleanToolResultsWrapper = async (ctx: any): Promise<{ evaluated: number; removed: number }> => {
+    // Get current context messages from session
+    const branch = ctx.sessionManager.getBranch();
+    // Extract toolResult messages
+    const messages: any[] = [];
+    for (const entry of branch) {
+      if (entry.type === "message" && entry.message?.role === "toolResult") {
+        messages.push(entry.message);
+      }
+    }
+    return doCleanToolResults(messages, indexer, currentConfig.value, ctx);
+  };
+
+  registerCommands(pi, currentConfig, flushPending, capturePendingBatches, syncToolActivation, () => statsAccum.getStats(), indexer, cleanToolResultsWrapper);
 }
