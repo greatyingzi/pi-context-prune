@@ -11,37 +11,63 @@ import type {
 } from "./types.js";
 import { serializeBatchForSummarizer, serializeAllBatchesForStructured } from "./batch-capture.js";
 
-const SYSTEM_PROMPT = `You are summarizing a batch of tool calls made by an AI coding assistant.
-For each tool call provide:
-- Tool name and a one-sentence description of what it did
-- Key outcome: success/failure and the most important data returned
-- Any findings the future conversation needs to remember
+const SYSTEM_PROMPT = `You are summarizing tool calls made by an AI coding assistant.
+The summary replaces the original tool output in future context, so preserve
+information the assistant may need later.
 
-Keep each tool call to 1-3 bullet points. Be concise.`;
+Summarize by tool type:
+
+- **read**: file path + key structure (exports, interfaces, function signatures,
+  class definitions). Omit implementation details and raw code. Note if the
+  file was empty or didn't exist.
+
+- **edit/write**: file path + what changed and why. Include function/variable
+  names affected. Omit unchanged code.
+
+- **bash**: command + exit code + critical output (errors, key results).
+  Omit verbose stdout/logs. For search commands (grep, find, rg), summarize
+  the number of matches and most relevant hits.
+
+- **Other tools**: tool name + one-sentence outcome + any data the assistant
+  will reference later.
+
+Keep each tool call to 1-3 bullet points. Be concise. Preserve specific names
+(variables, functions, file paths) verbatim.`,
 
 /**
  * System prompt for structured JSON summarization.
  * Requests strict JSON output with one entry per turn, keyed by turnIndex.
  */
 const STRUCTURED_SYSTEM_PROMPT = `You are summarizing tool calls from multiple turns of an AI coding assistant.
+The summaries replace the original tool outputs in future context, so preserve
+information the assistant may need later.
 Each turn is delimited by XML tags: <turn index="N"> ... </turn>.
 
-For each turn, provide a concise summary covering:
-- Tool names and what each did
-- Key outcomes: success/failure and the most important data
-- Any findings the future conversation needs to remember
+Summarize by tool type:
+
+- **read**: file path + key structure (exports, interfaces, function signatures,
+  class definitions). Omit implementation details and raw code.
+
+- **edit/write**: file path + what changed and why. Include function/variable
+  names affected. Omit unchanged code.
+
+- **bash**: command + exit code + critical output (errors, key results).
+  Omit verbose stdout/logs. For search commands, summarize match count
+  and most relevant hits.
+
+- **Other tools**: tool name + outcome + any data needed later.
 
 Respond with valid JSON only (no markdown fencing, no prose outside the JSON):
 {
   "summaries": [
     {
       "turnIndex": <number>,
-      "summaryText": "concise markdown summary of this turn's tool calls, 1-3 bullet points per tool"
+      "summaryText": "concise markdown summary, 1-3 bullet points per tool call, preserve specific names verbatim"
     }
   ]
 }
 
-Order the entries in the same order as the turns appear in the input.`;
+Order entries in the same order as turns appear in the input.`,
 
 /**
  * Maximum number of parallel LLM calls for summarization.
