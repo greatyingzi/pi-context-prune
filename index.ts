@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { loadConfig } from "./src/config.js";
 import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode, detectDiscardableReads } from "./src/batch-capture.js";
 import { getLastParsedFiles } from "./src/summarizer.js";
+import { extractKeywords, fuzzyMatchGraph, selectRelevantKnowledge, serializeForInjection } from "./src/knowledge-matcher.js";
 import { cleanToolResults as doCleanToolResults } from "./src/cleaner.js";
 import { KnowledgeGraph } from "./src/knowledge-graph.js";
 import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
@@ -63,6 +64,18 @@ export default function (pi: ExtensionAPI) {
   // Pending batches — accumulated until the prune trigger fires
   const pendingBatches: CapturedBatch[] = [];
   let isFlushing = false;
+
+  /** Extract plain text from a message (handles content array and string). */
+  const extractTextFromMessage = (msg: any): string => {
+    if (typeof msg.content === "string") return msg.content;
+    if (Array.isArray(msg.content)) {
+      return msg.content
+        .filter((b: any) => b.type === "text")
+        .map((b: any) => b.text ?? "")
+        .join(" ");
+    }
+    return "";
+  };
 
   /** Get current context usage percent from Pi, or undefined. */
   const getContextPercent = (ctx: ExtensionContext): number | null | undefined => {
@@ -562,19 +575,6 @@ export default function (pi: ExtensionAPI) {
             // Ignore knowledge graph persistence failures
           }
         }
-
-        // Inject knowledge graph into context as a steer message
-        const graphText = knowledgeGraph.serialize();
-        if (graphText && delivery === "runtime") {
-          try {
-            pi.sendMessage(
-              { customType: "context-prune-knowledge", content: graphText, display: false },
-              { deliverAs: "steer" }
-            );
-          } catch {
-            // Non-critical: knowledge graph is supplementary
-          }
-        }
       } catch (err) {
         return { ok: false, reason: isStaleContextError(err) ? "stale-context" : "failed", error: errorMessage(err) };
       }
@@ -785,7 +785,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── context: prune summarized tool results from next LLM call ─────────────
-  pi.on("context", async (event, _ctx) => {
+  pi.on("context", async (event, ctx) => {
     if (!currentConfig.value.enabled) return undefined;
 
     const indexEmpty = indexer.getIndex().size === 0;
@@ -815,6 +815,50 @@ export default function (pi: ExtensionAPI) {
           messages = annotated;
           changed = true;
         }
+      }
+    }
+
+    // Preflight knowledge retrieval: match knowledge graph to user prompt,
+    // then inject selected entries into context for the main LLM.
+    const graphSize = knowledgeGraph.getGraph().size;
+    if (graphSize > 0) {
+      try {
+        // Extract the last user message from the messages array
+        const lastUserMsg = [...messages].reverse().find((m: any) => m.role === "user");
+        if (lastUserMsg) {
+          const userText = extractTextFromMessage(lastUserMsg);
+          if (userText) {
+            // Step 1: keyword extraction + fuzzy match (code, zero cost)
+            const keywords = extractKeywords(userText);
+            if (keywords.length > 0) {
+              const candidates = fuzzyMatchGraph(knowledgeGraph.getGraph(), keywords);
+              if (candidates.length > 0) {
+                // Step 2: LLM selection (1 lightweight call)
+                const selected = await selectRelevantKnowledge(
+                  candidates, userText, currentConfig.value, ctx
+                );
+                const knowledgeText = serializeForInjection(selected);
+                if (knowledgeText) {
+                  // Inject as a pseudo-toolResult attached to the conversation
+                  // so it's visible to the main LLM without breaking role alternation
+                  const lastMsg = messages[messages.length - 1];
+                  if (lastMsg && lastMsg.role === "toolResult") {
+                    // Append to last toolResult's text
+                    const cloned = [...messages];
+                    const lastCloned = { ...cloned[cloned.length - 1] };
+                    const content = Array.isArray(lastCloned.content) ? lastCloned.content : [{ type: "text", text: String(lastCloned.content ?? "") }];
+                    lastCloned.content = [...content, { type: "text", text: "\n\n" + knowledgeText }];
+                    cloned[cloned.length - 1] = lastCloned;
+                    messages = cloned;
+                    changed = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Non-critical: knowledge matching is supplementary, don't block the main LLM
       }
     }
 
