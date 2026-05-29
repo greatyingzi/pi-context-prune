@@ -48,4 +48,4 @@ steps:
 
 ## Phase 5 — Validation
 - [x] step 10: brace-balance check on all changed files
-- [ ] step 11: git diff review and commit
+- [x] step 11: git diff review and commit

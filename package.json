@@ -12,13 +12,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/championswimmer/pi-context-prune.git"
+    "url": "git+https://github.com/greatyingzi/pi-context-prune.git"
   },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/championswimmer/pi-context-prune/issues"
+    "url": "https://github.com/greatyingzi/pi-context-prune/issues"
   },
-  "homepage": "https://github.com/championswimmer/pi-context-prune#readme",
+  "homepage": "https://github.com/greatyingzi/pi-context-prune#readme",
   "pi": {
     "extensions": [
       "./index.ts"

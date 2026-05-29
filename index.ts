@@ -56,7 +56,14 @@ export default function (pi: ExtensionAPI) {
   const pendingBatches: CapturedBatch[] = [];
   let isFlushing = false;
 
-  // ── Small-batch classification ───────────────────────────────────────────
+  /** Get current context usage percent from Pi, or undefined. */
+  const getContextPercent = (ctx: ExtensionContext): number | null | undefined => {
+    try {
+      return ctx.getContextUsage?.()?.percent;
+    } catch {
+      return undefined;
+    }
+  };
 
   /** Raw content threshold below which batches skip LLM summarization entirely. */
   const MIN_BATCH_RAW_CHARS_TO_SUMMARIZE = 800;
@@ -424,7 +431,7 @@ export default function (pi: ExtensionAPI) {
         return { ok: false, reason: isStaleContextError(err) ? "stale-context" : "failed", error: errorMessage(err) };
       }
 
-      setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
+      setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats(), getContextPercent(ctx));
 
       if (proc.smallBatches.length > 0) {
         safeNotify(
@@ -498,7 +505,7 @@ export default function (pi: ExtensionAPI) {
     pendingBatches.length = 0;
 
     // Update footer status
-    setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
+    setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats(), getContextPercent(ctx));
 
     // Toggle context_prune tool activation for agentic-auto mode
     syncToolActivation();

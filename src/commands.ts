@@ -47,9 +47,12 @@ class SettingsOverlay extends Container {
 
 // ── Status widget text ──────────────────────────────────────────────────────
 
-export function pruneStatusText(config: ContextPruneConfig, stats?: SummarizerStats): string {
+export function pruneStatusText(config: ContextPruneConfig, stats?: SummarizerStats, contextPercent?: number | null): string {
   const mode = PRUNE_ON_MODES.find((m) => m.value === config.pruneOn)?.label ?? config.pruneOn;
   let text = `prune: ${config.enabled ? "ON" : "OFF"} (${mode})`;
+  if (contextPercent != null) {
+    text += ` │ ctx ${Math.round(contextPercent)}%`;
+  }
   if (stats && stats.callCount > 0) {
     text += ` │ ↑${formatTokens(stats.totalInputTokens)} ↓${formatTokens(stats.totalOutputTokens)} ${formatCost(stats.totalCost)}`;
   }
@@ -60,12 +63,13 @@ export function setPruneStatusWidget(
   ctx: { ui: { setStatus: (id: string, text?: string) => void } },
   config: ContextPruneConfig,
   value?: SummarizerStats | string,
+  contextPercent?: number | null,
 ): void {
   if (!config.showPruneStatusLine) {
     ctx.ui.setStatus(STATUS_WIDGET_ID, undefined);
     return;
   }
-  ctx.ui.setStatus(STATUS_WIDGET_ID, typeof value === "string" ? value : pruneStatusText(config, value));
+  ctx.ui.setStatus(STATUS_WIDGET_ID, typeof value === "string" ? value : pruneStatusText(config, value, contextPercent));
 }
 
 // ── Subcommand list (for completions & interactive picker) ──────────────────
@@ -570,8 +574,16 @@ export function registerCommands(
           const statsLine = s.callCount > 0
             ? `\n  --- summarizer ---\n  calls:       ${s.callCount}\n  input:       ${formatTokens(s.totalInputTokens)} tokens\n  output:      ${formatTokens(s.totalOutputTokens)} tokens\n  cost:        ${formatCost(s.totalCost)}`
             : "\n  (no summarizer calls yet)";
+          // Show context usage if available
+          let ctxLine = "";
+          try {
+            const cu = ctx.getContextUsage?.();
+            if (cu?.percent != null) {
+              ctxLine = `\n  context:  ${Math.round(cu.percent)}% (${formatTokens(cu.tokens ?? 0)} / ${formatTokens(cu.contextWindow)})`;
+            }
+          } catch { /* not available in this context */ }
           ctx.ui.notify(
-            `pruner status:\n  enabled:  ${cfg.enabled}\n  model:    ${cfg.summarizerModel}\n  thinking: ${summarizerThinkingLabel(cfg.summarizerThinking)} (${cfg.summarizerThinking})\n  trigger:  ${mode}\n  batching: ${batchingModeLabel(cfg.batchingMode)} (${cfg.batchingMode})\n  status:   ${cfg.showPruneStatusLine ? "on" : "off"}\n  remind:   ${cfg.remindUnprunedCount ? "on" : "off"} (agentic-auto only)${statsLine}`,
+            `pruner status:\n  enabled:  ${cfg.enabled}\n  model:    ${cfg.summarizerModel}\n  thinking: ${summarizerThinkingLabel(cfg.summarizerThinking)} (${cfg.summarizerThinking})\n  trigger:  ${mode}\n  batching: ${batchingModeLabel(cfg.batchingMode)} (${cfg.batchingMode})\n  status:   ${cfg.showPruneStatusLine ? "on" : "off"}\n  remind:   ${cfg.remindUnprunedCount ? "on" : "off"} (agentic-auto only)${ctxLine}${statsLine}`,
           );
           break;
         }
