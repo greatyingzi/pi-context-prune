@@ -175,9 +175,6 @@ export async function cleanToolResults(
     return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
   }
 
-  // Build file edit history for LLM context
-  const editHistory = buildEditHistory(candidates);
-
   // Process in batches to avoid oversized prompts
   let llmRemoved = 0;
   for (let offset = 0; offset < llmCandidates.length; offset += MAX_EVAL_PER_CALL) {
