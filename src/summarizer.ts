@@ -83,6 +83,7 @@ Rules for "files":
 - "imports": key import statements (deduplicate, compact form).
 - "structure": interface/type signatures, function signatures, class definitions — signatures only, no bodies.
 - "changes": for edits/writes, what changed in this turn. Empty array for reads.
+- "tags": 3-8 lowercase single-word tags describing WHEN this file's knowledge would be relevant. Include: domain concepts ("validation", "email", "config"), technical roles ("middleware", "database", "api"), related feature names, and key identifiers. These tags are used for matching against user queries.
 - If a file appears in multiple turns, merge into one entry. Later edits overwrite earlier state.
 - Order entries in the same order as turns appear in the input.`;
 

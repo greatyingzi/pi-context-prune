@@ -325,6 +325,8 @@ export interface FileKnowledge {
   structure: string[];
   /** Edit descriptions (what changed, why) */
   changes: string[];
+  /** LLM-generated characteristic tags for matching (e.g. ["email", "validation", "config"]) */
+  tags: string[];
   /** Turn index of the most recent read */
   lastReadTurn: number;
   /** Turn index of the most recent edit/write */
@@ -341,6 +343,8 @@ export interface StructuredFileInfo {
   imports?: string[];
   structure?: string[];
   changes?: string[];
+  /** LLM-generated tags describing when this file's knowledge is relevant */
+  tags?: string[];
 }
 
 // ── Flush result ──────────────────────────────────────────────────────────────

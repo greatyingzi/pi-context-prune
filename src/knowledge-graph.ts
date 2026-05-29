@@ -49,6 +49,7 @@ export class KnowledgeGraph {
           imports: [],
           structure: [],
           changes: [],
+          tags: [],
           lastReadTurn: -1,
           lastEditTurn: -1,
         };
@@ -64,6 +65,20 @@ export class KnowledgeGraph {
       }
       if (info.structure && info.structure.length > 0) {
         entry.structure = [...new Set(info.structure)];
+      }
+
+      // Tags: merge (accumulate unique tags)
+      if (info.tags && info.tags.length > 0) {
+        for (const tag of info.tags) {
+          const tagLower = tag.toLowerCase();
+          if (!entry.tags.some((t) => t.toLowerCase() === tagLower)) {
+            entry.tags.push(tag);
+          }
+        }
+        // Cap at 15 tags per file
+        if (entry.tags.length > 15) {
+          entry.tags = entry.tags.slice(-15);
+        }
       }
 
       // Changes are additive — each edit is a separate event
