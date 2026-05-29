@@ -33,27 +33,28 @@ arguments, turn index, and a preview of the content. You also receive the file e
 DECISIVELY remove results that are clearly stale. The assistant can always re-read a file or
 use context_tree_query to recover removed content. Being too conservative wastes context space.
 
-For each result, weigh its current value:
-- Is the information still relevant to the current task, or was it exploratory?
-- Has the information been superseded by later work (file edits, new reads, decisions made)?
-- Could the assistant easily recover this information if needed (re-read, re-run command)?
-- Is this the ONLY source of some unique data (specific values, IDs, error details)?
+Evaluate results in THREE tiers based on age:
 
-REMOVE results where the value is low (information is stale, superseded, or easily recoverable):
-- Reads of files that were later edited — the content is outdated
-- Exploratory reads/scans from early turns that were just project orientation
-- Old grep/find results that were already acted upon
-- Old bash diagnostic outputs (ls, wc, node brace checks, etc.)
-- Summaries describing old file content that has since been changed
-- Any result whose information is redundant with newer context
+── TIER 1: Old results (20+ turns ago) — AGGRESSIVE pruning
+These are from early exploration. Default to REMOVE unless the result has clear ongoing value.
+- Old reads of files that were later edited — REMOVE (content is outdated)
+- Exploratory project scans, directory listings, initial reads — REMOVE
+- Old grep/find results already acted upon — REMOVE
+- Old bash diagnostics — REMOVE
+- Only KEEP if it's the sole source of unique, unrecoverable information
 
-KEEP results where the value is high:
-- The most recent read of each file (if file was NOT edited after the read)
-- All edit/write operations and their results
-- Results from the last 10 turns
-- Results containing unresolved errors
-- Results with unique data that cannot be easily recovered
-- Results the assistant is likely to reference again
+── TIER 2: Mid-session results (10–20 turns ago) — BALANCED pruning
+These may still be relevant. Judge by value:
+- Reads of files later edited — REMOVE (outdated)
+- Reads of files NOT later edited — KEEP if the information is still useful
+- Search results, diagnostics — REMOVE if already acted upon
+- Edit/write results — KEEP (record what changed)
+
+── TIER 3: Recent results (last 10 turns) — CONSERVATIVE pruning
+These are likely still relevant. Only remove if clearly redundant:
+- Exact duplicates of information available elsewhere — REMOVE
+- Trivial outputs (empty results, "not found") — REMOVE
+- Everything else — KEEP
 
 Respond with valid JSON only:
 {
@@ -263,9 +264,11 @@ export async function cleanToolResults(
     const batch = llmCandidates.slice(offset, offset + MAX_EVAL_PER_CALL);
     onPhase?.("llm");
 
-    const lines = batch.map((c, i) =>
-      `${offset + i + 1}. [${c.toolCallId}] turn ${c.turnIndex}: ${c.toolName}(${c.argsPreview})\n   Preview: ${c.resultPreview}`
-    );
+    const lines = batch.map((c, i) => {
+      const age = maxTurn - c.turnIndex;
+      const tier = age >= 20 ? "T1-old" : age >= 10 ? "T2-mid" : "T3-recent";
+      return `${offset + i + 1}. [${c.toolCallId}] turn ${c.turnIndex} (${tier}): ${c.toolName}(${c.argsPreview})\n   Preview: ${c.resultPreview}`;
+    });
 
     const editLines = editHistory.length > 0
       ? `\n\nFile edit history (these files were modified):\n${editHistory.map((e) => `  - turn ${e.turnIndex}: ${e.toolName} ${e.path}`).join("\n")}`
