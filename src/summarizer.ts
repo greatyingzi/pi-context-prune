@@ -9,7 +9,7 @@ import type {
   SummarizeBatchesOptions,
   SummarizeResult,
 } from "./types.js";
-import { serializeBatchForSummarizer } from "./batch-capture.js";
+import { serializeBatchForSummarizer, serializeAllBatchesForStructured } from "./batch-capture.js";
 
 const SYSTEM_PROMPT = `You are summarizing a batch of tool calls made by an AI coding assistant.
 For each tool call provide:
@@ -18,6 +18,106 @@ For each tool call provide:
 - Any findings the future conversation needs to remember
 
 Keep each tool call to 1-3 bullet points. Be concise.`;
+
+/**
+ * System prompt for structured JSON summarization.
+ * Requests strict JSON output with one entry per turn, keyed by turnIndex.
+ */
+const STRUCTURED_SYSTEM_PROMPT = `You are summarizing tool calls from multiple turns of an AI coding assistant.
+Each turn is delimited by XML tags: <turn index="N"> ... </turn>.
+
+For each turn, provide a concise summary covering:
+- Tool names and what each did
+- Key outcomes: success/failure and the most important data
+- Any findings the future conversation needs to remember
+
+Respond with valid JSON only (no markdown fencing, no prose outside the JSON):
+{
+  "summaries": [
+    {
+      "turnIndex": <number>,
+      "summaryText": "concise markdown summary of this turn's tool calls, 1-3 bullet points per tool"
+    }
+  ]
+}
+
+Order the entries in the same order as the turns appear in the input.`;
+
+/**
+ * Maximum number of parallel LLM calls for summarization.
+ * Batches are split into at most MAX_GROUPS groups, each summarized
+ * in one structured JSON LLM call.
+ */
+const MAX_GROUPS = 3;
+
+/**
+ * Maximum retry attempts per group. If a group's LLM call fails
+ * (network error, malformed JSON, etc.), it is retried up to this many times.
+ */
+const MAX_RETRIES = 3;
+
+/**
+ * Compute the number of groups for a given batch count.
+ * Algorithm: min(ceil(N / 3), MAX_GROUPS)
+ * This ensures at most 3 parallel LLM calls regardless of batch count.
+ */
+function computeGroupCount(n: number): number {
+  if (n <= 2) return 1;
+  const ceil = Math.ceil(n / 3);
+  return Math.min(ceil, MAX_GROUPS);
+}
+
+/**
+ * Split batches into groups of roughly equal size.
+ * Distribution: first (n % groups) groups get ceil(n/groups) batches,
+ * remaining groups get floor(n/groups) batches.
+ *
+ * Examples:
+ *   N=10, groups=3 → [4, 3, 3]
+ *   N=7,  groups=3 → [3, 2, 2]
+ *   N=5,  groups=2 → [3, 2]
+ *   N=3,  groups=1 → [3]
+ */
+function splitIntoGroups<T>(items: T[], groupCount: number): T[][] {
+  const base = Math.floor(items.length / groupCount);
+  const remainder = items.length % groupCount;
+  const groups: T[][] = [];
+  let offset = 0;
+  for (let i = 0; i < groupCount; i++) {
+    const size = base + (i < remainder ? 1 : 0);
+    groups.push(items.slice(offset, offset + size));
+    offset += size;
+  }
+  return groups;
+}
+
+/**
+ * Attempts to parse the LLM response as structured JSON.
+ * Tries: raw JSON → strip markdown fences → strip trailing comma → give up.
+ * Returns null if parsing fails after all attempts.
+ */
+function tryParseStructuredJson(text: string): { turnIndex: number; summaryText: string }[] | null {
+  let candidate = text.trim();
+
+  // Strip markdown code fences if present
+  const fenceMatch = candidate.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) candidate = fenceMatch[1].trim();
+
+  // Try direct parse
+  try {
+    const obj = JSON.parse(candidate);
+    if (obj && Array.isArray(obj.summaries)) return obj.summaries;
+  } catch {}
+
+  // Try removing trailing commas before ] or }
+  try {
+    const fixed = candidate.replace(/,\s*([}\]])/g, "$1");
+    const obj = JSON.parse(fixed);
+    if (obj && Array.isArray(obj.summaries)) return obj.summaries;
+  } catch {}
+
+  return null;
+}
 
 
 
@@ -218,14 +318,7 @@ export async function summarizeBatches(
 }
 
 /**
- * Chunk size for parallel summarization.
- * Each chunk is summarized independently via a single LLM call.
- * 3 batches per chunk keeps prompts manageable and avoids JSON-parsing fragility.
- */
-const CHUNK_SIZE = 3;
-
-/**
- * Summarizes all batches using chunked parallel LLM calls.
+ * Summarizes all batches using structured JSON LLM calls with at most 3 parallel groups.
  *
  * Batches are split into chunks of ~3, and each chunk is summarized
  * independently. For small chunks (≤1 batch) the simple path is used;
@@ -234,6 +327,18 @@ const CHUNK_SIZE = 3;
  *
  * This replaces the previous fragile structured-JSON single-call approach.
  * Chunked parallel calls are more reliable and scale better.
+ */
+/**
+ * Summarizes all batches using at most MAX_GROUPS parallel structured JSON LLM calls.
+ *
+ * Algorithm:
+ *   1. Split batches into at most 3 groups of roughly equal size
+ *   2. Each group is summarized in one LLM call with strict JSON output
+ *   3. If a group fails (network error, malformed JSON), retry up to MAX_RETRIES times
+ *   4. Never fall back to full parallel — failed groups produce null entries
+ *
+ * Token usage is attributed proportionally: input tokens by batch text-size ratio,
+ * output tokens and cost split evenly within each group.
  */
 export async function summarizeAllBatches(
   batches: CapturedBatch[],
@@ -246,188 +351,180 @@ export async function summarizeAllBatches(
     return [await summarizeBatch(batches[0], config, ctx, { signal: options.signal })];
   }
 
-  // Split into chunks and summarize each chunk in parallel.
-  const chunks: CapturedBatch[][] = [];
-  for (let i = 0; i < batches.length; i += CHUNK_SIZE) {
-    chunks.push(batches.slice(i, i + CHUNK_SIZE));
-  }
+  // Compute group count and split batches
+  const groupCount = computeGroupCount(batches.length);
+  const groups = splitIntoGroups(batches, groupCount);
 
-  // Run all chunks in parallel
-  const chunkResults = await Promise.all(
-    chunks.map(async (chunk) => {
-      if (chunk.length === 1) {
-        // Single batch in chunk — use the simple path
-        return [await summarizeBatch(chunk[0], config, ctx, {
-          signal: options.signal,
-          onTextProgress: (chars) => {
-            const globalIdx = batches.indexOf(chunk[0]);
-            options.onBatchTextProgress?.(globalIdx, batches.length, chunk[0], chars);
-          },
-        })];
+  // Summarize each group in parallel with retry logic
+  const groupResults = await Promise.all(
+    groups.map(async (group, groupIdx) => {
+      let lastAttempt: Array<SummarizeResult | null> | null = null;
+
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          ctx.ui.notify(
+            `pruner: retrying group ${groupIdx + 1}/${groupCount} (attempt ${attempt + 1}/${MAX_RETRIES})`,
+            "warning"
+          );
+        }
+
+        try {
+          const result = await summarizeGroup(group, config, ctx, batches, options);
+          lastAttempt = result;
+          // Check if all batches in the group were successfully summarized
+          if (result.every((r) => r !== null)) {
+            return result;
+          }
+          // Partial success (some nulls) — retry
+        } catch (err: any) {
+          if (options.signal?.aborted) throw err;
+          ctx.ui.notify(
+            `pruner: group ${groupIdx + 1} failed (${err.message}), will retry`,
+            "warning"
+          );
+          // Continue to next attempt
+        }
       }
 
-      // Multiple batches in chunk — serialize together and summarize in one call.
-      return summarizeChunk(chunk, config, ctx, batches, options);
+      // All retries exhausted — return the last attempt (may have some nulls)
+      ctx.ui.notify(
+        `pruner: group ${groupIdx + 1} failed after ${MAX_RETRIES} attempts — some summaries may be missing`,
+        "error"
+      );
+      return lastAttempt ?? group.map(() => null);
     })
   );
 
-  // Flatten chunk results into a single array aligned with the original batches
-  const results = chunkResults.flat();
-
-  // If any chunk produced null entries, fall back to full parallel (one call per batch).
-  // This handles cases where the LLM didn't follow the delimiter format correctly.
-  if (results.some((r) => r === null)) {
-    ctx.ui.notify(
-      "pruner: chunked summary had failures — falling back to parallel calls",
-      "warning"
-    );
-    return summarizeBatches(batches, config, ctx, options);
-  }
-
-  return results;
+  // Flatten group results into a single array aligned with the original batches
+  return groupResults.flat();
 }
 
 /**
- * Summarize a chunk of batches (2-3) in one LLM call.
- * Uses a simple concatenated prompt — no JSON parsing required.
- * The LLM returns summaries separated by a delimiter,
- * which are split client-side.
+ * Summarize a group of batches in one structured JSON LLM call.
+ * Returns an array of per-batch results aligned with the group.
  */
-async function summarizeChunk(
-  chunk: CapturedBatch[],
+async function summarizeGroup(
+  group: CapturedBatch[],
   config: ContextPruneConfig,
   ctx: ExtensionContext,
   allBatches: CapturedBatch[],
   options: SummarizeBatchesOptions
 ): Promise<Array<SummarizeResult | null>> {
-  const DELIMITER = "--- NEXT_BATCH ---";
-
-  try {
-    const model = resolveModel(config, ctx);
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) {
-      const authMessage = "error" in auth ? auth.error : "authentication failed";
-      ctx.ui.notify(`pruner: summarization failed: ${authMessage}`, "error");
-      return chunk.map(() => null);
-    }
-
-    // Serialize all batches in the chunk with clear delimiters
-    const chunkText = chunk.map((batch) => {
-      const globalIdx = allBatches.indexOf(batch);
-      return `=== Batch ${globalIdx + 1} (turn ${batch.turnIndex}) ===\n` + serializeBatchForSummarizer(batch);
-    }).join(`\n\n${DELIMITER}\n\n`);
-
-    const userMessage = `${SYSTEM_PROMPT}\n\nHere are ${chunk.length} batches to summarize.\n` +
-      `Provide a separate summary for each batch, separated by "${DELIMITER}".\n\n` +
-      `<tool-call-batches>\n${chunkText}\n</tool-call-batches>`;
-
-    let lastReportedChars = -1;
-    const reportTextProgress = (chars: number) => {
-      if (chars !== lastReportedChars) {
-        lastReportedChars = chars;
-        const globalIdx = allBatches.indexOf(chunk[0]);
-        options.onBatchTextProgress?.(globalIdx, allBatches.length, chunk[0], chars);
-      }
-    };
-    reportTextProgress(0);
-
-    const responseStream = stream(
-      model,
-      {
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: userMessage }],
-            timestamp: Date.now(),
-          },
-        ],
-      },
-      { apiKey: auth.apiKey, headers: auth.headers, signal: options.signal, ...summarizerThinkingOptions(config) }
-    );
-
-    for await (const event of responseStream) {
-      if (options.signal?.aborted) break;
-      if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
-        reportTextProgress(receivedTextChars(event.partial));
-      }
-    }
-
-    if (options.signal?.aborted) throw new Error("summarizeChunk: aborted during stream");
-
-    const response = await responseStream.result();
-    reportTextProgress(receivedTextChars(response));
-
-    if (response.stopReason === "aborted") {
-      throw new Error("summarizeChunk: stream stopped with reason aborted");
-    }
-    if (response.stopReason === "error") {
-      throw new Error(response.errorMessage ?? "Summarizer stopped with reason: error");
-    }
-
-    const llmText = response.content
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text)
-      .join("\n");
-
-    // Split by delimiter to get per-batch summaries
-    const parts = llmText.split(new RegExp(`${DELIMITER}`, "g"));
-
-    const results: Array<SummarizeResult | null> = [];
-    if (parts.length >= chunk.length) {
-      for (let i = 0; i < chunk.length; i++) {
-        const summaryText = parts[i].trim();
-        if (!summaryText) {
-          results.push(null);
-          continue;
-        }
-        // Split usage evenly across batches in the chunk
-        results.push({
-          summaryText,
-          usage: {
-            input: Math.round(response.usage.input / chunk.length),
-            output: Math.round(response.usage.output / chunk.length),
-            cacheRead: Math.round(response.usage.cacheRead / chunk.length),
-            cacheWrite: Math.round(response.usage.cacheWrite / chunk.length),
-            totalTokens: Math.round(response.usage.totalTokens / chunk.length),
-            cost: {
-              input: response.usage.cost.input / chunk.length,
-              output: response.usage.cost.output / chunk.length,
-              cacheRead: response.usage.cost.cacheRead / chunk.length,
-              cacheWrite: response.usage.cost.cacheWrite / chunk.length,
-              total: response.usage.cost.total / chunk.length,
-            },
-          },
-        });
-      }
-    } else {
-      // Parsing failed — use the whole text for the first batch, null for rest
-      ctx.ui.notify(
-        `pruner: chunk summary returned ${parts.length} part(s) instead of ${chunk.length}, splitting may be incomplete`,
-        "warning"
-      );
-      results.push({
-        summaryText: llmText.trim(),
-        usage: response.usage,
-      });
-      for (let i = 1; i < chunk.length; i++) {
-        results.push(null);
-      }
-    }
-
-    return results;
-  } catch (err: any) {
-    if (options.signal?.aborted) throw err;
-    // On failure, fall back to individual calls for this chunk
-    return Promise.all(
-      chunk.map(async (batch) => {
-        const globalIdx = allBatches.indexOf(batch);
-        return summarizeBatch(batch, config, ctx, {
-          signal: options.signal,
-          onTextProgress: (chars) => {
-            options.onBatchTextProgress?.(globalIdx, allBatches.length, batch, chars);
-          },
-        });
-      })
-    );
+  const model = resolveModel(config, ctx);
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) {
+    const authMessage = "error" in auth ? auth.error : "authentication failed";
+    ctx.ui.notify(`pruner: summarization failed: ${authMessage}`, "error");
+    return group.map(() => null);
   }
+
+  // Serialize all batches in the group with XML turn delimiters
+  const serialized = serializeAllBatchesForStructured(group);
+  const userMessage = "<tool-call-turns>\n" + serialized + "\n</tool-call-turns>";
+
+  let lastReportedChars = -1;
+  const reportTextProgress = (chars: number) => {
+    if (chars !== lastReportedChars) {
+      lastReportedChars = chars;
+      const globalIdx = allBatches.indexOf(group[0]);
+      options.onBatchTextProgress?.(globalIdx, allBatches.length, group[0], chars);
+    }
+  };
+  reportTextProgress(0);
+
+  const responseStream = stream(
+    model,
+    {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: STRUCTURED_SYSTEM_PROMPT + "\n\n" + userMessage }],
+          timestamp: Date.now(),
+        },
+      ],
+    },
+    { apiKey: auth.apiKey, headers: auth.headers, signal: options.signal, ...summarizerThinkingOptions(config) }
+  );
+
+  for await (const event of responseStream) {
+    if (options.signal?.aborted) break;
+    if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
+      reportTextProgress(receivedTextChars(event.partial));
+    }
+  }
+
+  if (options.signal?.aborted) throw new Error("summarizeGroup: aborted during stream");
+
+  const response = await responseStream.result();
+  reportTextProgress(receivedTextChars(response));
+
+  if (response.stopReason === "aborted") {
+    throw new Error("summarizeGroup: stream stopped with reason aborted");
+  }
+  if (response.stopReason === "error") {
+    throw new Error(response.errorMessage ?? "Summarizer stopped with reason: error");
+  }
+
+  const llmText = response.content
+    .filter((c: any) => c.type === "text")
+    .map((c: any) => c.text)
+    .join("\n");
+
+  // Parse structured JSON
+  const parsed = tryParseStructuredJson(llmText);
+  if (!parsed || parsed.length === 0) {
+    throw new Error(`structured summary returned no valid entries (${llmText.slice(0, 100)}...)`);
+  }
+
+  // Build a lookup map: turnIndex -> summaryText
+  const summaryMap = new Map<number, string>();
+  for (const entry of parsed) {
+    if (entry.turnIndex != null && entry.summaryText) {
+      summaryMap.set(entry.turnIndex, entry.summaryText);
+    }
+  }
+
+  // Attribute usage proportionally across batches in the group
+  const totalUsage = response.usage;
+  const totalInputChars = group.reduce((s, b) => {
+    return s + b.toolCalls.reduce((cs, tc) => cs + tc.resultText.length + JSON.stringify(tc.args).length, 0);
+  }, 0);
+
+  const results: Array<SummarizeResult | null> = [];
+  for (const batch of group) {
+    const summaryText = summaryMap.get(batch.turnIndex);
+    if (!summaryText) {
+      // This turn was not in the LLM response — mark as null
+      results.push(null);
+      continue;
+    }
+
+    // Attribute input tokens by text-size ratio, output tokens evenly
+    const batchInputChars = batch.toolCalls.reduce(
+      (s, tc) => s + tc.resultText.length + JSON.stringify(tc.args).length,
+      0
+    );
+    const inputRatio = totalInputChars > 0 ? batchInputChars / totalInputChars : 1 / group.length;
+    const outputRatio = 1 / group.length;
+
+    results.push({
+      summaryText,
+      usage: {
+        input: Math.round(totalUsage.input * inputRatio),
+        output: Math.round(totalUsage.output * outputRatio),
+        cacheRead: Math.round(totalUsage.cacheRead * inputRatio),
+        cacheWrite: Math.round(totalUsage.cacheWrite * inputRatio),
+        totalTokens: Math.round(totalUsage.totalTokens * ((inputRatio + outputRatio) / 2)),
+        cost: {
+          input: totalUsage.cost.input * inputRatio,
+          output: totalUsage.cost.output * outputRatio,
+          cacheRead: totalUsage.cost.cacheRead * inputRatio,
+          cacheWrite: totalUsage.cost.cacheWrite * inputRatio,
+          total: totalUsage.cost.total / group.length,
+        },
+      },
+    });
+  }
+
+  return results;
 }
