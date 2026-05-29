@@ -16,7 +16,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./src/config.js";
 import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode } from "./src/batch-capture.js";
-import { summarizeBatch, summarizeBatches } from "./src/summarizer.js";
+import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
 import { ToolCallIndexer } from "./src/indexer.js";
 import { pruneMessages } from "./src/pruner.js";
 import { annotateWithUnprunedCount, countUnprunedToolCalls } from "./src/reminder.js";
@@ -151,7 +151,7 @@ export default function (pi: ExtensionAPI) {
   // Summarizes + indexes all pending batches.
   // When options.onProgress is provided batches are processed sequentially
   // (one LLM call each) so the caller can update per-row UI. Otherwise all
-  // batches are summarized in parallel (one summarizeBatches call).
+  // batches are summarized in one structured LLM call (summarizeAllBatches).
   // Runtime delivery is used while the agent/tool loop is active so Pi can place
   // steer messages at protocol-safe boundaries. Session delivery is used only for
   // agent-message's final-message flush, where print-mode Pi may invalidate pi.*
@@ -216,8 +216,9 @@ export default function (pi: ExtensionAPI) {
           options.onProgress(i, batches.length, batches[i], r ? "done" : "skipped");
         }
       } else {
-        // Parallel — one LLM call per batch, all in flight simultaneously.
-        results = await summarizeBatches(batches, currentConfig.value, ctx, {
+        // Single structured call — all batches in one LLM request, JSON output parsed
+        // to extract per-turn summaries. Reduces N parallel calls to 1.
+        results = await summarizeAllBatches(batches, currentConfig.value, ctx, {
           onBatchTextProgress: reportBatchTextProgress,
           signal: options.signal,
         });

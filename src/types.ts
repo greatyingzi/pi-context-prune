@@ -374,7 +374,7 @@ export interface SummarizeBatchOptions {
   signal?: AbortSignal;
 }
 
-/** Options for summarizeBatches() when callers want live per-batch text progress. */
+/** Options for summarizeBatches() and summarizeAllBatches() when callers want live text progress. */
 export interface SummarizeBatchesOptions {
   /** Receives streamed summary text character counts for each batch. */
   onBatchTextProgress?: BatchTextProgressCallback;
