@@ -32,7 +32,7 @@ Summarize by tool type:
   will reference later.
 
 Keep each tool call to 1-3 bullet points. Be concise. Preserve specific names
-(variables, functions, file paths) verbatim.`,
+(variables, functions, file paths) verbatim.`;
 
 /**
  * System prompt for structured JSON summarization.
@@ -67,7 +67,7 @@ Respond with valid JSON only (no markdown fencing, no prose outside the JSON):
   ]
 }
 
-Order entries in the same order as turns appear in the input.`,
+Order entries in the same order as turns appear in the input.`;
 
 /**
  * Maximum number of parallel LLM calls for summarization.
