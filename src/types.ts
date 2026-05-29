@@ -334,6 +334,15 @@ export interface FileKnowledge {
 /** The full knowledge graph: Map<filePath, FileKnowledge> */
 export type KnowledgeGraphMap = Map<string, FileKnowledge>;
 
+/** File info extracted by the LLM during structured summarization. */
+export interface StructuredFileInfo {
+  path: string;
+  exports?: string[];
+  imports?: string[];
+  structure?: string[];
+  changes?: string[];
+}
+
 // ── Flush result ──────────────────────────────────────────────────────────────
 
 /** Per-category breakdown of a flush operation. */

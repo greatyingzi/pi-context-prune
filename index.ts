@@ -16,6 +16,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./src/config.js";
 import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode, detectDiscardableReads } from "./src/batch-capture.js";
+import { getLastParsedFiles } from "./src/summarizer.js";
 import { cleanToolResults as doCleanToolResults } from "./src/cleaner.js";
 import { KnowledgeGraph } from "./src/knowledge-graph.js";
 import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
@@ -62,15 +63,6 @@ export default function (pi: ExtensionAPI) {
   // Pending batches — accumulated until the prune trigger fires
   const pendingBatches: CapturedBatch[] = [];
   let isFlushing = false;
-
-  /** Extract file path from tool call args for knowledge graph. */
-  const extractFilePathForKnowledge = (toolName: string, args: Record<string, unknown>): string | undefined => {
-    if (toolName === "read" || toolName === "edit" || toolName === "write") {
-      const p = args.path ?? args.filePath;
-      return typeof p === "string" ? p : undefined;
-    }
-    return undefined;
-  };
 
   /** Get current context usage percent from Pi, or undefined. */
   const getContextPercent = (ctx: ExtensionContext): number | null | undefined => {
@@ -282,15 +274,6 @@ export default function (pi: ExtensionAPI) {
           summarizedSummaryChars += summaryText.length;
           summarizedToolCalls += batch.toolCalls.length;
           summarizedBatchesCount += 1;
-
-          // Update knowledge graph from summarized tool calls
-          for (const tc of batch.toolCalls) {
-            const filePath = extractFilePathForKnowledge(tc.toolName, tc.args);
-            if (filePath) {
-              const isEdit = tc.toolName === "edit" || tc.toolName === "write";
-              knowledgeGraph.updateFromSummary(filePath, result.summaryText, batch.turnIndex, isEdit);
-            }
-          }
         } else {
           oversizedBatches.push(batch);
           oversizedRawChars += batchRawCharCount;
@@ -521,6 +504,12 @@ export default function (pi: ExtensionAPI) {
       // batch (LLM failure). Batches before the first failure are persisted or
       // frontier-skipped; remaining are restored for retry.
       const proc = processResults(batches, results, smallBatchIndexes, discardableIndexes, delivery, appendEntry, appendSummaryMessage, ctx);
+
+      // Update knowledge graph from LLM-extracted file info
+      const parsedFiles = getLastParsedFiles();
+      if (parsedFiles.length > 0) {
+        knowledgeGraph.updateFromStructuredFiles(parsedFiles);
+      }
 
       // Restore unprocessed batches (those at and after the first failure)
       if (proc.firstFailureIndex >= 0) {

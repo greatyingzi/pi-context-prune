@@ -8,6 +8,7 @@ import type {
   SummarizeBatchOptions,
   SummarizeBatchesOptions,
   SummarizeResult,
+  StructuredFileInfo,
 } from "./types.js";
 import { serializeBatchForSummarizer, serializeAllBatchesForStructured } from "./batch-capture.js";
 
@@ -64,10 +65,26 @@ Respond with valid JSON only (no markdown fencing, no prose outside the JSON):
       "turnIndex": <number>,
       "summaryText": "concise markdown summary, 1-3 bullet points per tool call, preserve specific names verbatim"
     }
+  ],
+  "files": [
+    {
+      "path": "src/foo.ts",
+      "exports": ["Foo", "Bar"],
+      "imports": ["{ Baz } from qux"],
+      "structure": ["interface Config { ... }", "function parse(s: string): T"],
+      "changes": ["added validateEmail()"]
+    }
   ]
 }
 
-Order entries in the same order as turns appear in the input.`;
+Rules for "files":
+- Extract one entry per file that was read, edited, or written.
+- "exports": all exported names (functions, classes, interfaces, types, constants).
+- "imports": key import statements (deduplicate, compact form).
+- "structure": interface/type signatures, function signatures, class definitions — signatures only, no bodies.
+- "changes": for edits/writes, what changed in this turn. Empty array for reads.
+- If a file appears in multiple turns, merge into one entry. Later edits overwrite earlier state.
+- Order entries in the same order as turns appear in the input.`;
 
 /**
  * Maximum number of parallel LLM calls for summarization.
@@ -132,17 +149,41 @@ function tryParseStructuredJson(text: string): { turnIndex: number; summaryText:
   // Try direct parse
   try {
     const obj = JSON.parse(candidate);
-    if (obj && Array.isArray(obj.summaries)) return obj.summaries;
+    if (obj && Array.isArray(obj.summaries)) {
+      // Attach files data to the parsed result via a side channel
+      if (Array.isArray(obj.files)) {
+        try { _lastParsedFiles = obj.files; } catch {}
+      }
+      return obj.summaries;
+    }
   } catch {}
 
   // Try removing trailing commas before ] or }
   try {
     const fixed = candidate.replace(/,\s*([}\]])/g, "$1");
     const obj = JSON.parse(fixed);
-    if (obj && Array.isArray(obj.summaries)) return obj.summaries;
+    if (obj && Array.isArray(obj.summaries)) {
+      if (Array.isArray(obj.files)) {
+        try { _lastParsedFiles = obj.files; } catch {}
+      }
+      return obj.summaries;
+    }
   } catch {}
 
   return null;
+}
+
+/** Side channel: files extracted from the last successful structured JSON parse. */
+let _lastParsedFiles: StructuredFileInfo[] = [];
+
+/** Retrieve files extracted from the last structured JSON parse. */
+export function getLastParsedFiles(): StructuredFileInfo[] {
+  return _lastParsedFiles;
+}
+
+/** Reset the side channel (call before each summarizeGroup call). */
+export function resetParsedFiles(): void {
+  _lastParsedFiles = [];
 }
 
 
@@ -439,6 +480,9 @@ async function summarizeGroup(
     .filter((c: any) => c.type === "text")
     .map((c: any) => c.text)
     .join("\n");
+
+  // Reset side channel before parsing
+  resetParsedFiles();
 
   // Parse structured JSON
   const parsed = tryParseStructuredJson(llmText);
