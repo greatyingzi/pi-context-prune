@@ -75,6 +75,24 @@ export default function (pi: ExtensionAPI) {
   /** Whether a batch is too small to be worth an LLM summarization call. */
   const shouldSkipSmallBatch = (batch: CapturedBatch) => rawCharCount(batch) < MIN_BATCH_RAW_CHARS_TO_SUMMARIZE;
 
+  /** Build a placeholder message for discarded reads (no LLM call needed). */
+  const buildDiscardPlaceholder = (batch: CapturedBatch): string => {
+    const fileOps = batch.toolCalls
+      .filter((tc) => tc.toolName === "read" || tc.toolName === "edit" || tc.toolName === "write")
+      .map((tc) => {
+        const path = String(tc.args.path ?? tc.args.filePath ?? "unknown");
+        return `${tc.toolName} ${path}`;
+      });
+    const files = [...new Set(fileOps.map((op) => op.split(" ").slice(1).join(" ")))];
+    const toolCallIds = batch.toolCalls.map((tc) => tc.toolCallId).join(", ");
+    return [
+      `\u{1F4C4} Discarded stale/duplicate file reads (turn ${batch.turnIndex})`,
+      `Files: ${files.join(", ")}`,
+      `These file reads were superseded by later edits or newer reads and are no longer accurate.`,
+      `Use \`context_tree_query\` with IDs [${toolCallIds}] to recover original content, or re-read the file.`,
+    ].join("\n");
+  };
+
   // ── Batch classification + result processing ───────────────────────────────
 
   /**
@@ -178,7 +196,7 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
-      // Discardable reads: index them (so they get pruned from context) but no summary
+      // Discardable reads: index them (so they get pruned from context) + send placeholder
       if (discardableIndexes.has(i)) {
         totalRawCharCount += batchRawCharCount;
         totalToolCallCount += batch.toolCalls.length;
@@ -186,11 +204,20 @@ export default function (pi: ExtensionAPI) {
         discardableRawChars += batchRawCharCount;
         discardableToolCalls += batch.toolCalls.length;
         discardableBatchesCount += 1;
-        // Add to indexer so they get pruned from context
+        const placeholder = buildDiscardPlaceholder(batch);
+        const summaryRefs = indexer.allocateSummaryRefs(batch);
+        const batchDetails = makeSummaryDetails(batch, summaryRefs);
         try {
           if (delivery === "runtime") {
+            pi.sendMessage(
+              { customType: CUSTOM_TYPE_SUMMARY, content: placeholder, display: true, details: batchDetails },
+              { deliverAs: "steer" }
+            );
+            indexer.registerSummaryRefs(summaryRefs);
             indexer.addBatch(batch, pi);
           } else {
+            appendSummaryMessage(placeholder, batchDetails);
+            indexer.registerSummaryRefs(summaryRefs);
             persistBatchIndex(batch, appendEntry);
           }
         } catch (err) {
