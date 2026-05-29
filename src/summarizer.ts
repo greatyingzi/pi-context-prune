@@ -9,7 +9,7 @@ import type {
   SummarizeBatchesOptions,
   SummarizeResult,
 } from "./types.js";
-import { serializeBatchForSummarizer, serializeAllBatchesForStructured } from "./batch-capture.js";
+import { serializeBatchForSummarizer } from "./batch-capture.js";
 
 const SYSTEM_PROMPT = `You are summarizing a batch of tool calls made by an AI coding assistant.
 For each tool call provide:
@@ -19,29 +19,7 @@ For each tool call provide:
 
 Keep each tool call to 1-3 bullet points. Be concise.`;
 
-/**
- * System prompt for the structured (single-call) summarization path.
- * Requests JSON output with one entry per turn, keyed by turnIndex.
- */
-const STRUCTURED_SYSTEM_PROMPT = `You are summarizing tool calls from multiple turns of an AI coding assistant.
-Each turn is delimited by XML tags: <turn index="N"> ... </turn>.
 
-For each turn, provide a concise summary covering:
-- Tool names and what each did
-- Key outcomes: success/failure and the most important data
-- Any findings the future conversation needs to remember
-
-Respond with valid JSON only (no markdown fencing, no prose outside the JSON):
-{
-  "summaries": [
-    {
-      "turnIndex": <number>,  // must match the turn index from the XML tag
-      "summaryText": "concise markdown summary of this turn's tool calls, 1-3 bullet points per tool"
-    }
-  ]
-}
-
-Order the entries in the same order as the turns appear in the input.`;
 
 export function summarizerThinkingOptions(config: ContextPruneConfig): Record<string, unknown> {
   const level: SummarizerThinking = config.summarizerThinking;
@@ -240,44 +218,22 @@ export async function summarizeBatches(
 }
 
 /**
- * Attempts to parse the LLM response as structured JSON.
- * Tries: raw JSON → strip markdown fences → strip trailing comma → give up.
- * Returns null if parsing fails after all attempts.
+ * Chunk size for parallel summarization.
+ * Each chunk is summarized independently via a single LLM call.
+ * 3 batches per chunk keeps prompts manageable and avoids JSON-parsing fragility.
  */
-function tryParseStructuredJson(text: string): { turnIndex: number; summaryText: string }[] | null {
-  let candidate = text.trim();
-
-  // Strip markdown code fences if present
-  const fenceMatch = candidate.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch) candidate = fenceMatch[1].trim();
-
-  // Try direct parse
-  try {
-    const obj = JSON.parse(candidate);
-    if (obj && Array.isArray(obj.summaries)) return obj.summaries;
-  } catch {}
-
-  // Try removing trailing commas before ] or }
-  try {
-    const fixed = candidate.replace(/,\s*([}\]])/g, "$1");
-    const obj = JSON.parse(fixed);
-    if (obj && Array.isArray(obj.summaries)) return obj.summaries;
-  } catch {}
-
-  return null;
-}
+const CHUNK_SIZE = 3;
 
 /**
- * Summarizes all batches in a single LLM call using structured JSON output.
+ * Summarizes all batches using chunked parallel LLM calls.
  *
- * All pending batches are serialized with XML turn delimiters, sent to the LLM
- * in one request, and the JSON response is parsed to extract per-turn summaries.
- * This reduces N parallel LLM calls to 1 (or 2 for very large batches).
+ * Batches are split into chunks of ~3, and each chunk is summarized
+ * independently. For small chunks (≤1 batch) the simple path is used;
+ * for larger chunks all batches are sent in one call and the LLM
+ * returns concatenated summaries separated by a known delimiter.
  *
- * Returns an array of per-batch results (same shape as summarizeBatches).
- * Each element is either a SummarizeResult (success) or null (parsing failed).
- * Token usage is attributed proportionally: input tokens by batch text size ratio,
- * output tokens and cost split evenly.
+ * This replaces the previous fragile structured-JSON single-call approach.
+ * Chunked parallel calls are more reliable and scale better.
  */
 export async function summarizeAllBatches(
   batches: CapturedBatch[],
@@ -287,9 +243,64 @@ export async function summarizeAllBatches(
 ): Promise<Array<SummarizeResult | null>> {
   if (batches.length === 0) return [];
   if (batches.length === 1) {
-    // Single batch — use the standard path (no overhead from JSON parsing)
     return [await summarizeBatch(batches[0], config, ctx, { signal: options.signal })];
   }
+
+  // Split into chunks and summarize each chunk in parallel.
+  const chunks: CapturedBatch[][] = [];
+  for (let i = 0; i < batches.length; i += CHUNK_SIZE) {
+    chunks.push(batches.slice(i, i + CHUNK_SIZE));
+  }
+
+  // Run all chunks in parallel
+  const chunkResults = await Promise.all(
+    chunks.map(async (chunk) => {
+      if (chunk.length === 1) {
+        // Single batch in chunk — use the simple path
+        return [await summarizeBatch(chunk[0], config, ctx, {
+          signal: options.signal,
+          onTextProgress: (chars) => {
+            const globalIdx = batches.indexOf(chunk[0]);
+            options.onBatchTextProgress?.(globalIdx, batches.length, chunk[0], chars);
+          },
+        })];
+      }
+
+      // Multiple batches in chunk — serialize together and summarize in one call.
+      return summarizeChunk(chunk, config, ctx, batches, options);
+    })
+  );
+
+  // Flatten chunk results into a single array aligned with the original batches
+  const results = chunkResults.flat();
+
+  // If any chunk produced null entries, fall back to full parallel (one call per batch).
+  // This handles cases where the LLM didn't follow the delimiter format correctly.
+  if (results.some((r) => r === null)) {
+    ctx.ui.notify(
+      "pruner: chunked summary had failures — falling back to parallel calls",
+      "warning"
+    );
+    return summarizeBatches(batches, config, ctx, options);
+  }
+
+  return results;
+}
+
+/**
+ * Summarize a chunk of batches (2-3) in one LLM call.
+ * Uses a simple concatenated prompt — no JSON parsing required.
+ * The LLM returns summaries separated by a delimiter,
+ * which are split client-side.
+ */
+async function summarizeChunk(
+  chunk: CapturedBatch[],
+  config: ContextPruneConfig,
+  ctx: ExtensionContext,
+  allBatches: CapturedBatch[],
+  options: SummarizeBatchesOptions
+): Promise<Array<SummarizeResult | null>> {
+  const DELIMITER = "--- NEXT_BATCH ---";
 
   try {
     const model = resolveModel(config, ctx);
@@ -297,18 +308,25 @@ export async function summarizeAllBatches(
     if (!auth.ok) {
       const authMessage = "error" in auth ? auth.error : "authentication failed";
       ctx.ui.notify(`pruner: summarization failed: ${authMessage}`, "error");
-      return batches.map(() => null);
+      return chunk.map(() => null);
     }
 
-    const serialized = serializeAllBatchesForStructured(batches);
-    const userMessage = "<tool-call-turns>\n" + serialized + "\n</tool-call-turns>";
+    // Serialize all batches in the chunk with clear delimiters
+    const chunkText = chunk.map((batch) => {
+      const globalIdx = allBatches.indexOf(batch);
+      return `=== Batch ${globalIdx + 1} (turn ${batch.turnIndex}) ===\n` + serializeBatchForSummarizer(batch);
+    }).join(`\n\n${DELIMITER}\n\n`);
+
+    const userMessage = `${SYSTEM_PROMPT}\n\nHere are ${chunk.length} batches to summarize.\n` +
+      `Provide a separate summary for each batch, separated by "${DELIMITER}".\n\n` +
+      `<tool-call-batches>\n${chunkText}\n</tool-call-batches>`;
 
     let lastReportedChars = -1;
     const reportTextProgress = (chars: number) => {
       if (chars !== lastReportedChars) {
         lastReportedChars = chars;
-        // Report as the first batch for progress purposes
-        options.onBatchTextProgress?.(0, batches.length, batches[0], chars);
+        const globalIdx = allBatches.indexOf(chunk[0]);
+        options.onBatchTextProgress?.(globalIdx, allBatches.length, chunk[0], chars);
       }
     };
     reportTextProgress(0);
@@ -319,7 +337,7 @@ export async function summarizeAllBatches(
         messages: [
           {
             role: "user",
-            content: [{ type: "text", text: STRUCTURED_SYSTEM_PROMPT + "\n\n" + userMessage }],
+            content: [{ type: "text", text: userMessage }],
             timestamp: Date.now(),
           },
         ],
@@ -334,16 +352,16 @@ export async function summarizeAllBatches(
       }
     }
 
-    if (options.signal?.aborted) throw new Error("summarizeAllBatches: aborted during stream");
+    if (options.signal?.aborted) throw new Error("summarizeChunk: aborted during stream");
 
     const response = await responseStream.result();
     reportTextProgress(receivedTextChars(response));
 
     if (response.stopReason === "aborted") {
-      throw new Error("summarizeAllBatches: stream stopped with reason aborted");
+      throw new Error("summarizeChunk: stream stopped with reason aborted");
     }
     if (response.stopReason === "error") {
-      throw new Error(response.errorMessage ?? "Structured summarizer stopped with reason: error");
+      throw new Error(response.errorMessage ?? "Summarizer stopped with reason: error");
     }
 
     const llmText = response.content
@@ -351,74 +369,65 @@ export async function summarizeAllBatches(
       .map((c: any) => c.text)
       .join("\n");
 
-    const parsed = tryParseStructuredJson(llmText);
-    if (!parsed || parsed.length === 0) {
-      ctx.ui.notify(
-        "pruner: structured summary returned no valid entries — falling back to parallel calls",
-        "warning"
-      );
-      // Fall back to parallel-per-batch
-      return summarizeBatches(batches, config, ctx, options);
-    }
-
-    // Build a lookup map: turnIndex -> summaryText
-    const summaryMap = new Map<number, string>();
-    for (const entry of parsed) {
-      if (entry.turnIndex != null && entry.summaryText) {
-        summaryMap.set(entry.turnIndex, entry.summaryText);
-      }
-    }
-
-    // Attribute usage proportionally across batches
-    const totalUsage = response.usage;
-    const totalInputChars = batches.reduce((s, b) => {
-      return s + b.toolCalls.reduce((cs, tc) => cs + tc.resultText.length + JSON.stringify(tc.args).length, 0);
-    }, 0);
+    // Split by delimiter to get per-batch summaries
+    const parts = llmText.split(new RegExp(`${DELIMITER}`, "g"));
 
     const results: Array<SummarizeResult | null> = [];
-    for (const batch of batches) {
-      const summaryText = summaryMap.get(batch.turnIndex);
-      if (!summaryText) {
-        // This turn was not in the LLM response — mark as null
-        results.push(null);
-        continue;
-      }
-
-      // Attribute input tokens by text-size ratio, output tokens evenly
-      const batchInputChars = batch.toolCalls.reduce(
-        (s, tc) => s + tc.resultText.length + JSON.stringify(tc.args).length,
-        0
-      );
-      const inputRatio = totalInputChars > 0 ? batchInputChars / totalInputChars : 1 / batches.length;
-      const outputRatio = 1 / batches.length;
-
-      results.push({
-        summaryText,
-        usage: {
-          input: Math.round(totalUsage.input * inputRatio),
-          output: Math.round(totalUsage.output * outputRatio),
-          cacheRead: Math.round(totalUsage.cacheRead * inputRatio),
-          cacheWrite: Math.round(totalUsage.cacheWrite * inputRatio),
-          totalTokens: Math.round(totalUsage.totalTokens * ((inputRatio + outputRatio) / 2)),
-          cost: {
-            input: totalUsage.cost.input * inputRatio,
-            output: totalUsage.cost.output * outputRatio,
-            cacheRead: totalUsage.cost.cacheRead * inputRatio,
-            cacheWrite: totalUsage.cost.cacheWrite * inputRatio,
-            total: totalUsage.cost.total / batches.length,
+    if (parts.length >= chunk.length) {
+      for (let i = 0; i < chunk.length; i++) {
+        const summaryText = parts[i].trim();
+        if (!summaryText) {
+          results.push(null);
+          continue;
+        }
+        // Split usage evenly across batches in the chunk
+        results.push({
+          summaryText,
+          usage: {
+            input: Math.round(response.usage.input / chunk.length),
+            output: Math.round(response.usage.output / chunk.length),
+            cacheRead: Math.round(response.usage.cacheRead / chunk.length),
+            cacheWrite: Math.round(response.usage.cacheWrite / chunk.length),
+            totalTokens: Math.round(response.usage.totalTokens / chunk.length),
+            cost: {
+              input: response.usage.cost.input / chunk.length,
+              output: response.usage.cost.output / chunk.length,
+              cacheRead: response.usage.cost.cacheRead / chunk.length,
+              cacheWrite: response.usage.cost.cacheWrite / chunk.length,
+              total: response.usage.cost.total / chunk.length,
+            },
           },
-        },
+        });
+      }
+    } else {
+      // Parsing failed — use the whole text for the first batch, null for rest
+      ctx.ui.notify(
+        `pruner: chunk summary returned ${parts.length} part(s) instead of ${chunk.length}, splitting may be incomplete`,
+        "warning"
+      );
+      results.push({
+        summaryText: llmText.trim(),
+        usage: response.usage,
       });
+      for (let i = 1; i < chunk.length; i++) {
+        results.push(null);
+      }
     }
 
     return results;
   } catch (err: any) {
     if (options.signal?.aborted) throw err;
-    ctx.ui.notify(
-      `pruner: structured summarization failed (${err.message}) — falling back to parallel calls`,
-      "warning"
+    // On failure, fall back to individual calls for this chunk
+    return Promise.all(
+      chunk.map(async (batch) => {
+        const globalIdx = allBatches.indexOf(batch);
+        return summarizeBatch(batch, config, ctx, {
+          signal: options.signal,
+          onTextProgress: (chars) => {
+            options.onBatchTextProgress?.(globalIdx, allBatches.length, batch, chars);
+          },
+        });
+      })
     );
-    // Fall back to parallel-per-batch
-    return summarizeBatches(batches, config, ctx, options);
   }
 }

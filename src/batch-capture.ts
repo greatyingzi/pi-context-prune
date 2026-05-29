@@ -180,23 +180,6 @@ export function serializeBatchesForSummarizer(batches: CapturedBatch[]): string 
 }
 
 /**
- * Serializes multiple CapturedBatches with XML turn delimiters for the
- * structured (single-call) summarization path. Each batch is wrapped in
- * <turn index="N"> ... </turn> tags so the LLM can distinguish turns and
- * produce a JSON array keyed by turnIndex.
- *
- * Reuses serializeBatchForSummarizer() for the inner content of each turn.
- */
-export function serializeAllBatchesForStructured(batches: CapturedBatch[]): string {
-  return batches
-    .map((batch) => {
-      const body = serializeBatchForSummarizer(batch);
-      return `<turn index="${batch.turnIndex}">\n${body}\n</turn>`;
-    })
-    .join("\n\n");
-}
-
-/**
  * Groups CapturedBatches according to the chosen batching mode.
  *
  * - "turn"          : returns the input array unchanged (one summary per assistant turn).
