@@ -743,7 +743,8 @@ export function registerCommands(
               parts.push("  Changes take effect on the next LLM request.");
               ctx.ui.notify(`pruner: clean completed\n${parts.join("\n")}`, "info");
             }
-            setPruneStatusWidget(ctx, currentConfig.value, getStats(), getContextPercent(ctx));
+            const cu = ctx.getContextUsage?.();
+            setPruneStatusWidget(ctx, currentConfig.value, getStats(), cu?.percent);
           } catch (err: any) {
             ctx.ui.notify(`pruner: clean failed — ${err.message ?? err}`, "error");
             setPruneStatusWidget(ctx, currentConfig.value, getStats());
