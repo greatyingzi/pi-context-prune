@@ -807,17 +807,25 @@ export default function (pi: ExtensionAPI) {
 
   // ── Register /pruner command + summary message renderer ────────────
   // ── /pruner clean handler ──────────────────────────────────────────────────
-  const cleanToolResultsWrapper = async (ctx: any): Promise<{ evaluated: number; removed: number }> => {
-    // Get current context messages from session
+  const cleanToolResultsWrapper = async (ctx: any): Promise<{ evaluated: number; codeRemoved: number; llmRemoved: number }> => {
+    // Get current context messages and build batches from session branch
     const branch = ctx.sessionManager.getBranch();
-    // Extract toolResult messages
     const messages: any[] = [];
     for (const entry of branch) {
       if (entry.type === "message" && entry.message?.role === "toolResult") {
         messages.push(entry.message);
       }
     }
-    return doCleanToolResults(messages, indexer, currentConfig.value, ctx);
+    // Build pseudo-batches for code-based detection
+    const batches = captureUnindexedBatchesFromSession(branch, indexer);
+    return doCleanToolResults(messages, batches, indexer, currentConfig.value, ctx, (phase) => {
+      switch (phase) {
+        case "scan": setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — scanning…"); break;
+        case "code": setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — code detection…"); break;
+        case "llm":  setPruneStatusWidget(ctx, currentConfig.value, "prune: clean — LLM evaluating…"); break;
+        case "done": setPruneStatusWidget(ctx, currentConfig.value, getStats()); break;
+      }
+    });
   };
 
   registerCommands(pi, currentConfig, flushPending, capturePendingBatches, syncToolActivation, () => statsAccum.getStats(), indexer, cleanToolResultsWrapper);

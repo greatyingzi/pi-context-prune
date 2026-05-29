@@ -1,53 +1,54 @@
 /**
- * `/pruner clean` — LLM-evaluated stale tool result removal.
+ * `/pruner clean` — hybrid stale tool result removal.
  *
- * Scans the current context for toolResult messages that haven't been indexed,
- * asks the LLM which ones are stale/no longer needed, and adds them to the
- * indexer so they're pruned on the next context event.
+ * Phase 1 (code-based, deterministic): detect stale/duplicate file reads
+ *   using detectDiscardableReads() and detectStaleRecords().
+ * Phase 2 (LLM-evaluated): for remaining results, ask the LLM which are stale.
+ *
+ * Results are added to the indexer so they're pruned on the next context event.
  */
 
-import type { ContextPruneConfig, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { CapturedBatch, ContextPruneConfig } from "./types.js";
 import type { ToolCallIndexer } from "./indexer.js";
-import { CUSTOM_TYPE_INDEX } from "./types.js";
+import { detectDiscardableReads } from "./batch-capture.js";
 
 /** Max toolResults to send to LLM for evaluation at once. */
 const MAX_EVAL_BATCH = 60;
 
 /** Max chars of result text to include in the evaluation prompt. */
-const RESULT_PREVIEW_LENGTH = 150;
+const RESULT_PREVIEW_LENGTH = 200;
 
-const EVAL_SYSTEM_PROMPT = `You are evaluating tool call results from an AI coding assistant's conversation.
-The conversation has been going on for many turns. Some early tool results are now stale
-or no longer needed because:
-- The information has been superseded by later work (files were edited, decisions were made)
-- The results were exploratory and the relevant knowledge is already captured in later context
-- The results are very old and no longer relevant to the current task
+const EVAL_SYSTEM_PROMPT = `You are evaluating tool call results from a long AI coding session.
+The assistant has been working for many turns. Some early tool results are no longer needed.
 
 You will receive a list of tool results with their tool name, arguments, turn index, and
-a preview of the result text.
+a preview of the result text. You also receive a list of file edits that happened, so you
+can identify reads of files whose content has since changed.
 
-For each tool result, decide if it can be safely removed from context without losing
-information the assistant still needs. Be conservative — when in doubt, keep it.
+Decide which tool results can be safely removed from context. The results will be completely
+removed — the assistant won't be able to see them anymore (though they can be recovered).
 
-IMPORTANT: Always KEEP:
-- The most recent read of any file (the assistant may need to reference it)
-- Any edit/write operation (these describe what was changed)
-- Results from the last 5 turns (too recent to be stale)
-- Results containing error messages that haven't been resolved
-- Results with unique information not likely to appear elsewhere
+IMPORTANT — Always KEEP:
+- The most recent read of any file (unless that file was edited AFTER the read)
+- Any edit/write operation (these record what was changed)
+- Results from the last 10 turns (too recent to be stale)
+- Results containing errors that haven't been resolved
+- Results with unique information (e.g., specific values, IDs, names) not repeated elsewhere
 
 Safe to REMOVE:
-- Old reads of files that were later edited (content is outdated)
-- Duplicate/exploratory reads where the information is captured elsewhere
-- Very old search results (grep/find) that were just exploration
-- Old bash outputs that were one-time checks
+- Old reads of files that were later edited (content is outdated — the file has changed)
+- Very old exploratory reads (project structure, initial scanning) from 30+ turns ago
+- Old search results (grep/find) that were just exploration and already acted upon
+- Old bash outputs that were one-time diagnostic checks
+- Duplicate reads of the same file where the information is captured in a later read
 
 Respond with valid JSON only:
 {
   "removeIds": ["toolCallId1", "toolCallId2", ...]
 }
 
-If no results should be removed, respond: { "removeIds": [] }`;
+If nothing should be removed: { "removeIds": [] }`;
 
 interface ToolResultInfo {
   toolCallId: string;
@@ -55,6 +56,16 @@ interface ToolResultInfo {
   argsPreview: string;
   turnIndex: number;
   resultPreview: string;
+  filePath?: string;
+}
+
+/** Extract file path from tool call args if applicable. */
+function filePathFromArgs(toolName: string, args: Record<string, unknown>): string | undefined {
+  if (toolName === "read" || toolName === "edit" || toolName === "write") {
+    const p = args.path ?? args.filePath;
+    return typeof p === "string" ? p : undefined;
+  }
+  return undefined;
 }
 
 /** Extract a short preview of tool call arguments. */
@@ -74,19 +85,26 @@ function truncate(text: string, maxLen: number): string {
 }
 
 /**
- * Scan context messages for unindexed toolResults, ask LLM which are stale,
- * and add them to the indexer.
+ * Hybrid stale content removal: code-based detection first, then LLM evaluation.
  *
- * @returns number of tool results marked for removal
+ * @param messages   ToolResult messages from the session branch
+ * @param batches    CapturedBatches reconstructed from the session (for code-based detection)
+ * @param indexer    The tool call indexer
+ * @param config     Current pruner config
+ * @param ctx        Extension context (for LLM access)
  */
 export async function cleanToolResults(
   messages: any[],
+  batches: CapturedBatch[],
   indexer: ToolCallIndexer,
   config: ContextPruneConfig,
   ctx: ExtensionContext,
-): Promise<{ evaluated: number; removed: number }> {
+  onPhase?: (phase: "scan" | "code" | "llm" | "done") => void,
+): Promise<{ evaluated: number; codeRemoved: number; llmRemoved: number }> {
+  onPhase?.("scan");
   // Collect unindexed toolResults
   const candidates: ToolResultInfo[] = [];
+  const maxTurn = Math.max(...messages.map((m: any) => m.turnIndex ?? 0), 0);
 
   for (const msg of messages) {
     if (msg.role !== "toolResult") continue;
@@ -107,24 +125,66 @@ export async function cleanToolResults(
       argsPreview: argsPreview(args),
       turnIndex,
       resultPreview: truncate(resultText, RESULT_PREVIEW_LENGTH),
+      filePath: filePathFromArgs(toolName, args),
     });
   }
 
   if (candidates.length === 0) {
-    return { evaluated: 0, removed: 0 };
+    return { evaluated: 0, codeRemoved: 0, llmRemoved: 0 };
   }
 
-  // Limit batch size
-  const batch = candidates.slice(0, MAX_EVAL_BATCH);
+  // ── Phase 1: Code-based detection (deterministic, zero cost) ──────────
+  onPhase?.("code");
+
+  // 1a. Detect stale/duplicate reads using the same logic as flushPending
+  const discardableIds = detectDiscardableReads(batches);
+
+  // 1b. Detect stale records using indexer history (reads before edits)
+  indexer.detectStaleRecords();
+  const staleIds = indexer.getStaleIds();
+
+  let codeRemoved = 0;
+  const remaining: ToolResultInfo[] = [];
+
+  for (const candidate of candidates) {
+    if (discardableIds.has(candidate.toolCallId) || staleIds.has(candidate.toolCallId)) {
+      // Deterministically stale — remove without LLM
+      addToIndexer(indexer, candidate);
+      codeRemoved++;
+    } else {
+      remaining.push(candidate);
+    }
+  }
+
+  // ── Phase 2: LLM evaluation for remaining results ─────────────────────
+  onPhase?.("llm");
+
+  if (remaining.length === 0) {
+    return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
+  }
+
+  // Build file edit history for LLM context
+  const editHistory = buildEditHistory(candidates);
+  const recentThreshold = Math.max(maxTurn - 10, 0);
+
+  // Filter out very recent results (don't waste LLM tokens evaluating them)
+  const llmCandidates = remaining.filter((c) => c.turnIndex <= recentThreshold).slice(0, MAX_EVAL_BATCH);
+
+  if (llmCandidates.length === 0) {
+    return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
+  }
 
   // Build evaluation prompt
-  const lines = batch.map((c, i) =>
-    `${i + 1}. [${c.toolCallId}] turn ${c.turnIndex}: ${c.toolName}(${c.argsPreview})\n   Result: ${c.resultPreview}`
+  const lines = llmCandidates.map((c, i) =>
+    `${i + 1}. [${c.toolCallId}] turn ${c.turnIndex}: ${c.toolName}(${c.argsPreview})\n   Preview: ${c.resultPreview}`
   );
 
-  const userMessage = `Evaluate these ${batch.length} tool results. Which can be safely removed?\n\n${lines.join("\n\n")}`;
+  const editLines = editHistory.length > 0
+    ? `\n\nFile edit history (these files were modified):\n${editHistory.map((e) => `  - turn ${e.turnIndex}: ${e.toolName} ${e.path}`).join("\n")}`
+    : "";
 
-  // Call LLM
+  const userMessage = `Current turn is ~${maxTurn}. Evaluate these ${llmCandidates.length} tool results from earlier turns.${editLines}\n\nWhich can be safely removed?\n\n${lines.join("\n\n")}`;
+
   try {
     const model = ctx.model;
     const response = await model.complete([
@@ -132,47 +192,56 @@ export async function cleanToolResults(
       { role: "user", content: userMessage },
     ]);
 
-    const text = typeof response === "string" ? response : response.content ?? "";
+    const text = typeof response === "string" ? response : (response as any).content ?? "";
     const parsed = tryParseJson(text);
 
     if (!parsed || !Array.isArray(parsed.removeIds)) {
-      return { evaluated: batch.length, removed: 0 };
+      return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
     }
 
     const removeSet = new Set(parsed.removeIds);
-    let removed = 0;
+    let llmRemoved = 0;
 
-    for (const candidate of batch) {
+    for (const candidate of llmCandidates) {
       if (removeSet.has(candidate.toolCallId)) {
-        // Add to indexer as "summarized" (no actual summary, just marks for pruning)
-        indexer.getIndex().set(candidate.toolCallId, {
-          toolCallId: candidate.toolCallId,
-          toolName: candidate.toolName,
-          args: {},
-          resultText: "",
-          isError: false,
-          turnIndex: candidate.turnIndex,
-          timestamp: 0,
-          filePath: undefined,
-        });
-        removed++;
+        addToIndexer(indexer, candidate);
+        llmRemoved++;
       }
     }
 
-    return { evaluated: batch.length, removed };
-  } catch (err) {
-    return { evaluated: batch.length, removed: 0 };
+    return { evaluated: candidates.length, codeRemoved, llmRemoved };
+  } catch {
+    return { evaluated: candidates.length, codeRemoved, llmRemoved: 0 };
   }
+}
+
+/** Add a tool result to the indexer as "summarized" (marks it for pruning). */
+function addToIndexer(indexer: ToolCallIndexer, info: ToolResultInfo): void {
+  indexer.getIndex().set(info.toolCallId, {
+    toolCallId: info.toolCallId,
+    toolName: info.toolName,
+    args: {},
+    resultText: "",
+    isError: false,
+    turnIndex: info.turnIndex,
+    timestamp: 0,
+    filePath: info.filePath,
+  });
+}
+
+/** Build a list of file edit operations for LLM context. */
+function buildEditHistory(candidates: ToolResultInfo[]): Array<{ toolName: string; path: string; turnIndex: number }> {
+  return candidates
+    .filter((c) => (c.toolName === "edit" || c.toolName === "write") && c.filePath)
+    .map((c) => ({ toolName: c.toolName, path: c.filePath!, turnIndex: c.turnIndex }));
 }
 
 /** Try to parse JSON from LLM response, handling markdown fences. */
 function tryParseJson(text: string): { removeIds: string[] } | null {
-  // Strip markdown code fences if present
   let cleaned = text.trim();
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
   }
-  // Find first { and last }
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
   if (start === -1 || end === -1) return null;

@@ -726,21 +726,27 @@ export function registerCommands(
             ctx.ui.notify("Context pruning is disabled. Run /pruner on first.", "warning");
             break;
           }
-          ctx.ui.notify("pruner: evaluating stale content…", "info");
+          setPruneStatusWidget(ctx, currentConfig.value, "prune: scanning stale content…");
+          ctx.ui.notify("pruner clean: phase 1/2 — code-based stale detection…", "info");
           try {
             const result = await cleanToolResults(ctx);
+            const total = result.codeRemoved + result.llmRemoved;
             if (result.evaluated === 0) {
               ctx.ui.notify("pruner: no unprocessed tool results found in context — nothing to clean.", "info");
-            } else if (result.removed === 0) {
+            } else if (total === 0) {
               ctx.ui.notify(`pruner: evaluated ${result.evaluated} tool results — nothing stale enough to remove.`, "info");
             } else {
-              ctx.ui.notify(
-                `pruner: clean completed\n  ✓ evaluated ${result.evaluated} tool results\n  ✕ removed ${result.removed} stale result${result.removed === 1 ? "" : "s"} from context\n  Removal takes effect on the next LLM request.`,
-                "info"
-              );
+              const parts: string[] = [];
+              if (result.codeRemoved > 0) parts.push(`  ✕ code-detected: ${result.codeRemoved} stale read${result.codeRemoved === 1 ? "" : "s"} (files later edited)`);
+              if (result.llmRemoved > 0) parts.push(`  ✕ LLM-evaluated: ${result.llmRemoved} obsolete result${result.llmRemoved === 1 ? "" : "s"}`);
+              parts.push(`  ── ${total} result${total === 1 ? "" : "s"} removed from ${result.evaluated} evaluated`);
+              parts.push("  Changes take effect on the next LLM request.");
+              ctx.ui.notify(`pruner: clean completed\n${parts.join("\n")}`, "info");
             }
+            setPruneStatusWidget(ctx, currentConfig.value, getStats(), getContextPercent(ctx));
           } catch (err: any) {
             ctx.ui.notify(`pruner: clean failed — ${err.message ?? err}`, "error");
+            setPruneStatusWidget(ctx, currentConfig.value, getStats());
           }
           break;
         }
