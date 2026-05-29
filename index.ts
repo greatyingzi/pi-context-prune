@@ -350,6 +350,14 @@ export default function (pi: ExtensionAPI) {
     pendingBatches.unshift(...batches);
   };
 
+  const extractFilePath = (toolName: string, args: Record<string, unknown>): string | undefined => {
+    if (toolName === "read" || toolName === "edit" || toolName === "write") {
+      const p = args.path ?? args.filePath;
+      return typeof p === "string" ? p : undefined;
+    }
+    return undefined;
+  };
+
   const persistBatchIndex = (batch: CapturedBatch, appendEntry: (customType: string, data?: unknown) => void) => {
     const records = batch.toolCalls.map((tc) => ({
       toolCallId: tc.toolCallId,
@@ -359,6 +367,7 @@ export default function (pi: ExtensionAPI) {
       isError: tc.isError,
       turnIndex: batch.turnIndex,
       timestamp: batch.timestamp,
+      filePath: extractFilePath(tc.toolName, tc.args),
     }));
 
     for (const record of records) {
@@ -366,6 +375,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     appendEntry(CUSTOM_TYPE_INDEX, { toolCalls: records } as IndexEntryData);
+
+    // Re-detect stale records after adding new entries
+    indexer.detectStaleRecords();
   };
 
   // ── Helper: capture + trim + group pending batches (no LLM work) ──────────

@@ -11,6 +11,8 @@ export class ToolCallIndexer {
   private index = new Map<string, ToolCallRecord>();
   private aliasToToolCallId = new Map<string, string>();
   private nextShortAliasNumber = 1;
+  /** Set of toolCallIds whose content is stale (e.g. reads of files later edited). */
+  private stale = new Set<string>();
 
   /**
    * Rebuilds the in-memory index from session history by scanning all
@@ -21,6 +23,7 @@ export class ToolCallIndexer {
     this.index.clear();
     this.aliasToToolCallId.clear();
     this.nextShortAliasNumber = 1;
+    this.stale.clear();
 
     const entries = branch ?? ctx.sessionManager.getBranch();
     for (const entry of entries) {
@@ -39,6 +42,9 @@ export class ToolCallIndexer {
         this.registerSummaryRefs(refs);
       }
     }
+
+    // Detect stale records from the reconstructed index
+    this.detectStaleRecords();
   }
 
   /**
@@ -46,6 +52,64 @@ export class ToolCallIndexer {
    */
   isSummarized(toolCallId: string): boolean {
     return this.index.has(toolCallId);
+  }
+
+  /** Extract file path from tool call args if applicable (read/edit/write). */
+  private extractFilePath(toolName: string, args: Record<string, unknown>): string | undefined {
+    if (toolName === "read" || toolName === "edit" || toolName === "write") {
+      const p = args.path ?? args.filePath;
+      return typeof p === "string" ? p : undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * Scan all indexed records to detect stale reads.
+   * A read is stale if the file it read was later edited/written by another indexed record.
+   * Called after each flush to retroactively mark old reads as stale.
+   */
+  detectStaleRecords(): void {
+    // Collect all files that have been mutated (edit/write)
+    const mutatedFiles = new Map<string, number[]>(); // path → [order indices of mutations]
+    const readRecords = new Map<string, Array<{ toolCallId: string; order: number }>>(); // path → reads
+
+    let order = 0;
+    for (const [_id, record] of this.index) {
+      const path = record.filePath;
+      if (!path) { order++; continue; }
+
+      if (record.toolName === "edit" || record.toolName === "write") {
+        if (!mutatedFiles.has(path)) mutatedFiles.set(path, []);
+        mutatedFiles.get(path)!.push(order);
+      } else if (record.toolName === "read") {
+        if (!readRecords.has(path)) readRecords.set(path, []);
+        readRecords.get(path)!.push({ toolCallId: record.toolCallId, order });
+      }
+      order++;
+    }
+
+    // For each file with reads, find reads that precede any mutation
+    for (const [path, reads] of readRecords) {
+      const mutations = mutatedFiles.get(path);
+      if (!mutations || mutations.length === 0) continue; // no edits → nothing stale
+
+      for (const read of reads) {
+        // If this read comes before ANY mutation of the same file, it's stale
+        if (mutations.some((mOrder) => read.order < mOrder)) {
+          this.stale.add(read.toolCallId);
+        }
+      }
+    }
+  }
+
+  /** Check if a toolCallId is marked as stale. */
+  isStale(toolCallId: string): boolean {
+    return this.stale.has(toolCallId);
+  }
+
+  /** Get all stale toolCallIds. */
+  getStaleIds(): Set<string> {
+    return this.stale;
   }
 
   /**
@@ -130,11 +194,15 @@ export class ToolCallIndexer {
         isError: tc.isError,
         turnIndex: batch.turnIndex,
         timestamp: batch.timestamp,
+        filePath: this.extractFilePath(tc.toolName, tc.args),
       };
       this.index.set(record.toolCallId, record);
       records.push(record);
     }
 
     pi.appendEntry(CUSTOM_TYPE_INDEX, { toolCalls: records } as IndexEntryData);
+
+    // Re-detect stale records after adding new entries
+    this.detectStaleRecords();
   }
 }

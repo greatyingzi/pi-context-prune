@@ -233,6 +233,8 @@ export interface ToolCallRecord {
   isError: boolean;
   turnIndex: number;
   timestamp: number;
+  /** File path extracted from args, if applicable (read/edit/write). Used for stale-read detection. */
+  filePath?: string;
 }
 
 // ── Session persistence types ──────────────────────────────────────────────
