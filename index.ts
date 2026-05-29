@@ -808,12 +808,16 @@ export default function (pi: ExtensionAPI) {
   // ── Register /pruner command + summary message renderer ────────────
   // ── /pruner clean handler ──────────────────────────────────────────────────
   const cleanToolResultsWrapper = async (ctx: any): Promise<{ evaluated: number; codeRemoved: number; llmRemoved: number }> => {
-    // Get current context messages and build batches from session branch
+    // Get ALL messages from session branch (toolResults + summaries)
     const branch = ctx.sessionManager.getBranch();
     const messages: any[] = [];
     for (const entry of branch) {
-      if (entry.type === "message" && entry.message?.role === "toolResult") {
-        messages.push(entry.message);
+      if (entry.type === "message") {
+        const msg = entry.message;
+        // Include toolResult messages and summary messages
+        if (msg.role === "toolResult" || msg.customType === CUSTOM_TYPE_SUMMARY) {
+          messages.push(msg);
+        }
       }
     }
     // Build pseudo-batches for code-based detection
