@@ -33,20 +33,27 @@ arguments, turn index, and a preview of the content. You also receive the file e
 DECISIVELY remove results that are clearly stale. The assistant can always re-read a file or
 use context_tree_query to recover removed content. Being too conservative wastes context space.
 
-REMOVE these without hesitation:
+For each result, weigh its current value:
+- Is the information still relevant to the current task, or was it exploratory?
+- Has the information been superseded by later work (file edits, new reads, decisions made)?
+- Could the assistant easily recover this information if needed (re-read, re-run command)?
+- Is this the ONLY source of some unique data (specific values, IDs, error details)?
+
+REMOVE results where the value is low (information is stale, superseded, or easily recoverable):
 - Reads of files that were later edited — the content is outdated
-- Exploratory reads from 20+ turns ago that were just project scanning
+- Exploratory reads/scans from early turns that were just project orientation
 - Old grep/find results that were already acted upon
 - Old bash diagnostic outputs (ls, wc, node brace checks, etc.)
-- Summaries of old file reads where the file has since been edited
-- Any result older than 30 turns that isn't the ONLY source of unique information
+- Summaries describing old file content that has since been changed
+- Any result whose information is redundant with newer context
 
-KEEP only:
+KEEP results where the value is high:
 - The most recent read of each file (if file was NOT edited after the read)
 - All edit/write operations and their results
 - Results from the last 10 turns
 - Results containing unresolved errors
 - Results with unique data that cannot be easily recovered
+- Results the assistant is likely to reference again
 
 Respond with valid JSON only:
 {
