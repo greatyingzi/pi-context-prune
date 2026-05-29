@@ -7,13 +7,13 @@ steps:
       - "- [x] step 1: analyze read/write patterns and define discard rules"
   - phase: implementation
     steps:
-      - "- [ ] step 2: add detectDiscardableReads() to batch-capture.ts"
-      - "- [ ] step 3: integrate discardable detection into flushPending classify phase"
-      - "- [ ] step 4: discardable tool calls get indexed but no summary (direct prune)"
-      - "- [ ] step 5: add discardable count to FlushBreakdown and notification"
+      - "- [x] step 2: add detectDiscardableReads() to batch-capture.ts"
+      - "- [x] step 3: integrate discardable detection into flushPending classify phase"
+      - "- [x] step 4: discardable tool calls get indexed but no summary (direct prune)"
+      - "- [x] step 5: add discardable count to FlushBreakdown and notification"
   - phase: validation
     steps:
-      - "- [ ] step 6: brace balance + commit + push"
+      - "- [x] step 6: brace balance + commit + push"
 ---
 
 # 035 — Smart discard of stale file reads
