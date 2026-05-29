@@ -57,8 +57,22 @@ export default function (pi: ExtensionAPI) {
   let isFlushing = false;
 
   type FlushResult =
-    | { ok: true; reason: "flushed" | "skipped-oversized"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
+    | { ok: true; reason: "flushed" | "skipped-oversized" | "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
     | { ok: false; reason: "empty" | "already-flushing" | "summarizer-failed" | "stale-context" | "failed" | "aborted"; error?: string };
+
+  // Small tool results are usually not worth an LLM summarization call: the
+  // summary can be larger than the raw output, and the fixed LLM latency/cost is
+  // pure overhead. These batches advance the frontier so they are not retried.
+  const MIN_BATCH_RAW_CHARS_TO_SUMMARIZE = 800;
+
+  const rawCharCount = (batch: CapturedBatch) => batch.toolCalls.reduce((s, tc) => s + tc.resultText.length, 0);
+
+  const shouldSkipSmallBatch = (batch: CapturedBatch) => rawCharCount(batch) < MIN_BATCH_RAW_CHARS_TO_SUMMARIZE;
+
+  const formatTurnList = (batches: CapturedBatch[], max = 12) => {
+    const turns = batches.slice(0, max).map((b) => b.turnIndex).join(", ");
+    return batches.length > max ? `${turns}, …` : turns;
+  };
 
   type SessionAppender = {
     appendCustomEntry(customType: string, data?: unknown): string;
@@ -198,59 +212,100 @@ export default function (pi: ExtensionAPI) {
         options.onBatchTextProgress?.(index, total, batch, receivedChars);
       };
 
-      // Summarize batches. When onProgress is provided (i.e. /pruner now with the
-      // multi-row overlay) we process sequentially so each row can be checked off
-      // as its LLM call completes. Otherwise all batches run in parallel.
-      let results: (import("./src/types.js").SummarizeResult | null)[];
+      // Classify tiny batches before any LLM work. They are not worth
+      // summarizing because the summary often exceeds the raw content. We still
+      // process them below so the frontier advances and they are not retried.
+      const smallBatchIndexes = new Set<number>();
+      const summarizableBatches: { batch: CapturedBatch; originalIndex: number }[] = [];
+      batches.forEach((batch, index) => {
+        if (shouldSkipSmallBatch(batch)) {
+          smallBatchIndexes.add(index);
+        } else {
+          summarizableBatches.push({ batch, originalIndex: index });
+        }
+      });
+
+      // Summarize only batches that clear the minimum raw-size threshold. When
+      // onProgress is provided (i.e. /pruner now with the multi-row overlay), we
+      // process sequentially so each row can be checked off as its LLM call
+      // completes; small rows are marked skipped without an LLM call.
+      const results: Array<import("./src/types.js").SummarizeResult | null | undefined> = new Array(batches.length);
       if (options.onProgress) {
-        results = [];
         for (let i = 0; i < batches.length; i++) {
           options.onProgress(i, batches.length, batches[i], "start");
+          if (smallBatchIndexes.has(i)) {
+            options.onProgress(i, batches.length, batches[i], "skipped");
+            continue;
+          }
           const r = await summarizeBatch(batches[i], currentConfig.value, ctx, {
             signal: options.signal,
             onTextProgress: (receivedChars) => {
               reportBatchTextProgress(i, batches.length, batches[i], receivedChars);
             },
           });
-          results.push(r);
+          results[i] = r;
           options.onProgress(i, batches.length, batches[i], r ? "done" : "skipped");
         }
-      } else {
-        // Single structured call — all batches in one LLM request, JSON output parsed
-        // to extract per-turn summaries. Reduces N parallel calls to 1.
-        results = await summarizeAllBatches(batches, currentConfig.value, ctx, {
-          onBatchTextProgress: reportBatchTextProgress,
-          signal: options.signal,
+      } else if (summarizableBatches.length > 0) {
+        // Structured multi-batch summarization only sees worthwhile candidates.
+        const summarizedResults = await summarizeAllBatches(
+          summarizableBatches.map((entry) => entry.batch),
+          currentConfig.value,
+          ctx,
+          {
+            onBatchTextProgress: (index, _total, batch, receivedChars) => {
+              const originalIndex = summarizableBatches[index]?.originalIndex ?? batches.indexOf(batch);
+              reportBatchTextProgress(originalIndex, batches.length, batch, receivedChars);
+            },
+            signal: options.signal,
+          }
+        );
+        summarizedResults.forEach((result, index) => {
+          results[summarizableBatches[index].originalIndex] = result;
         });
       }
 
-      // Process results in order; stop at first null (individual call failure).
-      // Batches before the first failure are persisted; remaining are restored to
-      // pendingBatches so they are retried on the next flush.
+      // Process results in original order; stop at first null for a summarizable
+      // batch (LLM failure). Batches before the first failure are persisted or
+      // frontier-skipped; remaining are restored for retry.
       const processedBatches: CapturedBatch[] = [];
       let totalRawCharCount = 0;
       let totalSummaryCharCount = 0;
       let totalToolCallCount = 0;
+      const smallBatches: CapturedBatch[] = [];
       const oversizedBatches: CapturedBatch[] = [];
+      const summarizedBatches: CapturedBatch[] = [];
       let firstFailureIndex = -1;
 
       for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        const batchRawCharCount = rawCharCount(batch);
+
+        if (smallBatchIndexes.has(i)) {
+          // Tiny results are intentionally not summarized or indexed. Advancing
+          // the frontier is enough to avoid repeated LLM attempts for them.
+          totalRawCharCount += batchRawCharCount;
+          totalToolCallCount += batch.toolCalls.length;
+          smallBatches.push(batch);
+          processedBatches.push(batch);
+          continue;
+        }
+
         const result = results[i];
         if (!result) {
           firstFailureIndex = i;
           break;
         }
 
-        const batch = batches[i];
-        const batchRawCharCount = batch.toolCalls.reduce((s, tc) => s + tc.resultText.length, 0);
+        totalRawCharCount += batchRawCharCount;
+        totalToolCallCount += batch.toolCalls.length;
+
         const summaryRefs = indexer.allocateSummaryRefs(batch);
         const summaryText = result.summaryText + formatSummaryToolCallRefs(summaryRefs);
         const shouldSkipOversized = summaryText.length > batchRawCharCount;
 
         statsAccum.add(result.usage);
-        totalRawCharCount += batchRawCharCount;
         totalSummaryCharCount += summaryText.length;
-        totalToolCallCount += batch.toolCalls.length;
 
         const batchDetails = makeSummaryDetails(batch, summaryRefs);
 
@@ -269,6 +324,7 @@ export default function (pi: ExtensionAPI) {
               indexer.registerSummaryRefs(summaryRefs);
               persistBatchIndex(batch, appendEntry);
             }
+            summarizedBatches.push(batch);
           } else {
             oversizedBatches.push(batch);
           }
@@ -299,7 +355,12 @@ export default function (pi: ExtensionAPI) {
       // Advance frontier to the last batch we actually processed.
       const lastBatch = processedBatches[processedBatches.length - 1];
       const lastTC = lastBatch.toolCalls[lastBatch.toolCalls.length - 1];
-      const allOversized = oversizedBatches.length === processedBatches.length;
+      const frontierOutcome: PruneFrontier["outcome"] =
+        summarizedBatches.length > 0
+          ? "summarized"
+          : oversizedBatches.length > 0
+            ? "skipped-oversized"
+            : "skipped-small";
       const frontierSnapshot: PruneFrontier = {
         lastAttemptedToolCallId: lastTC.toolCallId,
         lastAttemptedToolName: lastTC.toolName,
@@ -309,7 +370,7 @@ export default function (pi: ExtensionAPI) {
         attemptedToolCallCount: totalToolCallCount,
         rawCharCount: totalRawCharCount,
         summaryCharCount: totalSummaryCharCount,
-        outcome: allOversized ? "skipped-oversized" : "summarized",
+        outcome: frontierOutcome,
       };
 
       try {
@@ -332,19 +393,25 @@ export default function (pi: ExtensionAPI) {
 
       setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
 
-      // Notify about oversized batches that were skipped — show a single summary
-      if (oversizedBatches.length > 0) {
-        const turns = oversizedBatches.map((b) => b.turnIndex).join(", ");
+      if (smallBatches.length > 0) {
         safeNotify(
           ctx,
-          `pruner: skipped ${oversizedBatches.length} turn(s) (${turns}) — summary(s) larger than raw content`,
+          `pruner: skipped ${smallBatches.length} small turn(s) (${formatTurnList(smallBatches)}) — raw output under ${MIN_BATCH_RAW_CHARS_TO_SUMMARIZE} chars`,
+          "info"
+        );
+      }
+
+      if (oversizedBatches.length > 0) {
+        safeNotify(
+          ctx,
+          `pruner: skipped ${oversizedBatches.length} oversized turn(s) (${formatTurnList(oversizedBatches)}) — summary(s) larger than raw content`,
           "info"
         );
       }
 
       return {
         ok: true,
-        reason: allOversized ? "skipped-oversized" : "flushed",
+        reason: frontierOutcome === "summarized" ? "flushed" : frontierOutcome,
         batchCount: processedBatches.length,
         toolCallCount: totalToolCallCount,
         rawCharCount: totalRawCharCount,

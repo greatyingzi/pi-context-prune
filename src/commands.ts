@@ -346,7 +346,7 @@ export function registerCommands(
   pi: ExtensionAPI,
   currentConfig: { value: ContextPruneConfig },
   flushPending: (ctx: ExtensionCommandContext, options?: FlushOptions) => Promise<
-    | { ok: true; reason: "flushed" | "skipped-oversized"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
+    | { ok: true; reason: "flushed" | "skipped-oversized" | "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
     | { ok: false; reason: string; error?: string }
   >,
   capturePendingBatches: (ctx: ExtensionCommandContext) => CapturedBatch[],
@@ -752,7 +752,15 @@ export function registerCommands(
           if (result.reason === "skipped-oversized") {
             ctx.ui.notify(
               `pruner: skipped pruning ${result.toolCallCount} tool call${result.toolCallCount === 1 ? "" : "s"} — summary was ${result.summaryCharCount} chars vs ${result.rawCharCount} raw chars; frontier advanced past this range`,
-              "warning"
+              "info"
+            );
+            break;
+          }
+
+          if (result.reason === "skipped-small") {
+            ctx.ui.notify(
+              `pruner: skipped ${result.toolCallCount} small tool call${result.toolCallCount === 1 ? "" : "s"} from ${result.batchCount} batch${result.batchCount === 1 ? "" : "es"} — raw output ${result.rawCharCount} chars was below the summarization threshold; frontier advanced past this range`,
+              "info"
             );
             break;
           }
