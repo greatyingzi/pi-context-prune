@@ -766,6 +766,7 @@ export function registerCommands(
             formatFlushNotification({
               summarized: result.summarized,
               skippedSmall: result.skippedSmall,
+              discarded: result.discarded,
               skippedOversized: result.skippedOversized,
             }),
             "info"

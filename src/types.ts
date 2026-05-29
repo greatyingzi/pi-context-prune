@@ -325,6 +325,7 @@ const fmtChars = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
 export function formatFlushNotification(r: {
   summarized: FlushBreakdown;
   skippedSmall: FlushBreakdown;
+  discarded: FlushBreakdown;
   skippedOversized: FlushBreakdown;
 }): string {
   const lines: string[] = [];
@@ -340,11 +341,19 @@ export function formatFlushNotification(r: {
     );
   }
 
+  const d = r.discarded;
+  if (d.toolCallCount > 0) {
+    activeCategories++;
+    lines.push(
+      `  ✕ discarded ${d.toolCallCount} stale read${d.toolCallCount === 1 ? "" : "s"} from ${d.batchCount} turn${d.batchCount === 1 ? "" : "s"}: ${fmtChars(d.rawCharCount)} chars (replaced/obsolete file reads)`
+    );
+  }
+
   const sm = r.skippedSmall;
   if (sm.toolCallCount > 0) {
     activeCategories++;
     lines.push(
-      `  ⤏ skipped ${sm.toolCallCount} small call${sm.toolCallCount === 1 ? "" : "s"} from ${sm.batchCount} turn${sm.batchCount === 1 ? "" : "s"}: ${fmtChars(sm.rawCharCount)} chars (below threshold, kept as-is)`
+      `  ⤴ skipped ${sm.toolCallCount} small call${sm.toolCallCount === 1 ? "" : "s"} from ${sm.batchCount} turn${sm.batchCount === 1 ? "" : "s"}: ${fmtChars(sm.rawCharCount)} chars (below threshold, kept as-is)`
     );
   }
 
@@ -352,21 +361,22 @@ export function formatFlushNotification(r: {
   if (ov.toolCallCount > 0) {
     activeCategories++;
     lines.push(
-      `  ⤏ skipped ${ov.toolCallCount} oversized call${ov.toolCallCount === 1 ? "" : "s"} from ${ov.batchCount} turn${ov.batchCount === 1 ? "" : "s"}: summary ${fmtChars(ov.summaryCharCount)} chars ≥ raw ${fmtChars(ov.rawCharCount)} chars (kept as-is)`
+      `  ⤴ skipped ${ov.toolCallCount} oversized call${ov.toolCallCount === 1 ? "" : "s"} from ${ov.batchCount} turn${ov.toolCallCount === 1 ? "" : "s"}: summary ${fmtChars(ov.summaryCharCount)} chars ≥ raw ${fmtChars(ov.rawCharCount)} chars (kept as-is)`
     );
   }
 
   // Only show summary line when multiple categories are present (otherwise it repeats the detail)
   if (activeCategories > 1) {
-    const totalCalls = s.toolCallCount + sm.toolCallCount + ov.toolCallCount;
-    const totalBatches = s.batchCount + sm.batchCount + ov.batchCount;
-    const totalRaw = s.rawCharCount + sm.rawCharCount + ov.rawCharCount;
-    const totalSummary = s.summaryCharCount + sm.rawCharCount + ov.rawCharCount; // non-summarized keep raw
-    const totalSaved = totalRaw - totalSummary;
+    const totalCalls = s.toolCallCount + d.toolCallCount + sm.toolCallCount + ov.toolCallCount;
+    const totalBatches = s.batchCount + d.batchCount + sm.batchCount + ov.batchCount;
+    const totalRaw = s.rawCharCount + d.rawCharCount + sm.rawCharCount + ov.rawCharCount;
+    // Discarded content is removed entirely; summarized replaced with summary; others keep raw
+    const totalRemaining = s.summaryCharCount + sm.rawCharCount + ov.rawCharCount;
+    const totalSaved = totalRaw - totalRemaining;
     const totalPct = totalRaw > 0 ? Math.round((totalSaved / totalRaw) * 100) : 0;
 
     lines.push(
-      `  ── ${totalCalls} call${totalCalls === 1 ? "" : "s"} across ${totalBatches} turn${totalBatches === 1 ? "" : "s"}: ${fmtChars(totalRaw)} → ${fmtChars(totalSummary)} chars (${totalPct}% net compression)`
+      `  ── ${totalCalls} call${totalCalls === 1 ? "" : "s"} across ${totalBatches} turn${totalBatches === 1 ? "" : "s"}: ${fmtChars(totalRaw)} → ${fmtChars(totalRemaining)} chars (${totalPct}% net compression)`
     );
   }
 
@@ -389,6 +399,7 @@ export type FlushResult =
       /** Per-category breakdown */
       summarized: FlushBreakdown;
       skippedSmall: FlushBreakdown;
+      discarded: FlushBreakdown;
       skippedOversized: FlushBreakdown;
     }
   | { ok: false; reason: "empty" | "already-flushing" | "summarizer-failed" | "stale-context" | "failed" | "aborted"; error?: string };

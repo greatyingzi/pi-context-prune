@@ -15,7 +15,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./src/config.js";
-import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode } from "./src/batch-capture.js";
+import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode, detectDiscardableReads } from "./src/batch-capture.js";
 import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
 import { ToolCallIndexer } from "./src/indexer.js";
 import { pruneMessages } from "./src/pruner.js";
@@ -83,15 +83,25 @@ export default function (pi: ExtensionAPI) {
    */
   const classifyBatches = (batches: CapturedBatch[]) => {
     const smallBatchIndexes = new Set<number>();
+    const discardableIndexes = new Set<number>();
     const summarizableBatches: { batch: CapturedBatch; originalIndex: number }[] = [];
+
+    // Detect stale/duplicate file reads across all batches
+    const discardableIds = detectDiscardableReads(batches);
+
     batches.forEach((batch, index) => {
-      if (shouldSkipSmallBatch(batch)) {
+      // Check if ALL tool calls in this batch are discardable
+      const allDiscardable = batch.toolCalls.length > 0 &&
+        batch.toolCalls.every((tc) => discardableIds.has(tc.toolCallId));
+      if (allDiscardable) {
+        discardableIndexes.add(index);
+      } else if (shouldSkipSmallBatch(batch)) {
         smallBatchIndexes.add(index);
       } else {
         summarizableBatches.push({ batch, originalIndex: index });
       }
     });
-    return { smallBatchIndexes, summarizableBatches };
+    return { smallBatchIndexes, discardableIndexes, summarizableBatches };
   };
 
   // ── Result processing ──────────────────────────────────────────────────────
@@ -104,6 +114,7 @@ export default function (pi: ExtensionAPI) {
     batches: CapturedBatch[],
     results: Array<SummarizeResult | null | undefined>,
     smallBatchIndexes: Set<number>,
+    discardableIndexes: Set<number>,
     delivery: "runtime" | "session",
     appendEntry: (customType: string, data?: unknown) => void,
     appendSummaryMessage: (content: string, details: unknown) => void,
@@ -143,6 +154,9 @@ export default function (pi: ExtensionAPI) {
     let smallRawChars = 0;
     let smallToolCalls = 0;
     let smallBatchesCount = 0;
+    let discardableRawChars = 0;
+    let discardableToolCalls = 0;
+    let discardableBatchesCount = 0;
     let oversizedRawChars = 0;
     let oversizedSummaryChars = 0;
     let oversizedToolCalls = 0;
@@ -161,6 +175,31 @@ export default function (pi: ExtensionAPI) {
         smallRawChars += batchRawCharCount;
         smallToolCalls += batch.toolCalls.length;
         smallBatchesCount += 1;
+        continue;
+      }
+
+      // Discardable reads: index them (so they get pruned from context) but no summary
+      if (discardableIndexes.has(i)) {
+        totalRawCharCount += batchRawCharCount;
+        totalToolCallCount += batch.toolCalls.length;
+        processedBatches.push(batch);
+        discardableRawChars += batchRawCharCount;
+        discardableToolCalls += batch.toolCalls.length;
+        discardableBatchesCount += 1;
+        // Add to indexer so they get pruned from context
+        try {
+          if (delivery === "runtime") {
+            indexer.addBatch(batch, pi);
+          } else {
+            persistBatchIndex(batch, appendEntry);
+          }
+        } catch (err) {
+          if (isStaleContextError(err)) {
+            restoreBatches(batches.slice(i));
+            break;
+          }
+          throw err;
+        }
         continue;
       }
 
@@ -224,6 +263,7 @@ export default function (pi: ExtensionAPI) {
       totalRawCharCount, totalSummaryCharCount, totalToolCallCount, firstFailureIndex,
       summarizedRawChars, summarizedSummaryChars, summarizedToolCalls, summarizedBatchesCount,
       smallRawChars, smallToolCalls, smallBatchesCount,
+      discardableRawChars, discardableToolCalls, discardableBatchesCount,
       oversizedRawChars, oversizedSummaryChars, oversizedToolCalls, oversizedBatchesCount,
     };
   };
@@ -369,7 +409,7 @@ export default function (pi: ExtensionAPI) {
       };
 
       // Classify tiny batches before any LLM work.
-      const { smallBatchIndexes, summarizableBatches } = classifyBatches(batches);
+      const { smallBatchIndexes, discardableIndexes, summarizableBatches } = classifyBatches(batches);
 
       // Summarize only batches that clear the minimum raw-size threshold. When
       // onProgress is provided (i.e. /pruner now with the multi-row overlay), we
@@ -380,6 +420,10 @@ export default function (pi: ExtensionAPI) {
         for (let i = 0; i < batches.length; i++) {
           options.onProgress(i, batches.length, batches[i], "start");
           if (smallBatchIndexes.has(i)) {
+            options.onProgress(i, batches.length, batches[i], "skipped");
+            continue;
+          }
+          if (discardableIndexes.has(i)) {
             options.onProgress(i, batches.length, batches[i], "skipped");
             continue;
           }
@@ -413,7 +457,7 @@ export default function (pi: ExtensionAPI) {
       // Process results in original order; stop at first null for a summarizable
       // batch (LLM failure). Batches before the first failure are persisted or
       // frontier-skipped; remaining are restored for retry.
-      const proc = processResults(batches, results, smallBatchIndexes, delivery, appendEntry, appendSummaryMessage, ctx);
+      const proc = processResults(batches, results, smallBatchIndexes, discardableIndexes, delivery, appendEntry, appendSummaryMessage, ctx);
 
       // Restore unprocessed batches (those at and after the first failure)
       if (proc.firstFailureIndex >= 0) {
@@ -480,6 +524,12 @@ export default function (pi: ExtensionAPI) {
           rawCharCount: proc.smallRawChars,
           summaryCharCount: 0,
         },
+        discarded: {
+          batchCount: proc.discardableBatchesCount,
+          toolCallCount: proc.discardableToolCalls,
+          rawCharCount: proc.discardableRawChars,
+          summaryCharCount: 0,
+        },
         skippedOversized: {
           batchCount: proc.oversizedBatchesCount,
           toolCallCount: proc.oversizedToolCalls,
@@ -499,6 +549,7 @@ export default function (pi: ExtensionAPI) {
         summaryCharCount: proc.totalSummaryCharCount,
         summarized: breakdown.summarized,
         skippedSmall: breakdown.skippedSmall,
+        discarded: breakdown.discarded,
         skippedOversized: breakdown.skippedOversized,
       };
     } catch (err) {

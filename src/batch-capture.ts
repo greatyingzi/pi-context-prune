@@ -241,3 +241,94 @@ export function groupBatchesByMode(batches: CapturedBatch[], mode: BatchingMode)
 
   return out;
 }
+
+// ── Smart discard: stale/duplicate file reads ─────────────────────────────────
+
+/** Extract the file path from a tool call's args. */
+function filePathFromArgs(toolName: string, args: Record<string, unknown>): string | undefined {
+  if (toolName === "read" || toolName === "edit" || toolName === "write") {
+    // Pi uses {path: "..."} for read/edit/write
+    const p = args.path ?? args.filePath;
+    return typeof p === "string" ? p : undefined;
+  }
+  if (toolName === "bash") {
+    // Try to extract file paths from common bash patterns
+    // This is best-effort; we don't need to catch every case
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Detect tool calls whose results can be discarded entirely (no summary needed).
+ *
+ * Discard rules:
+ *   1. **Stale read**: a `read` of file X that appears before an `edit`/`write` of file X
+ *   2. **Duplicate read**: file X was read N times — keep only the last, discard the rest
+ *
+ * Discarded tool calls are indexed (pruned from context) but receive no summary.
+ * `context_tree_query` still works — the original result is preserved in the indexer.
+ *
+ * @param batches Batches in chronological order (earliest first)
+ * @returns Set of toolCallIds that can be discarded
+ */
+export function detectDiscardableReads(batches: CapturedBatch[]): Set<string> {
+  const discardable = new Set<string>();
+
+  // Pass 1: collect all file-mutating operations (edit/write) by path
+  // and all read operations by path, with their turn order index
+  const mutatedFiles = new Set<string>();
+  const readsByPath = new Map<string, Array<{ toolCallId: string; order: number }>>();
+
+  let order = 0;
+  for (const batch of batches) {
+    for (const tc of batch.toolCalls) {
+      const path = filePathFromArgs(tc.toolName, tc.args);
+      if (!path) { order++; continue; }
+
+      if (tc.toolName === "edit" || tc.toolName === "write") {
+        mutatedFiles.add(path);
+      } else if (tc.toolName === "read") {
+        if (!readsByPath.has(path)) readsByPath.set(path, []);
+        readsByPath.get(path)!.push({ toolCallId: tc.toolCallId, order });
+      }
+      order++;
+    }
+  }
+
+  // Pass 2: apply discard rules
+  for (const [path, reads] of readsByPath) {
+    // Rule 1: stale reads — if file was mutated, all reads before the first mutation are stale
+    if (mutatedFiles.has(path)) {
+      // Find the first edit/write order for this path
+      let firstMutationOrder = Infinity;
+      order = 0;
+      for (const batch of batches) {
+        for (const tc of batch.toolCalls) {
+          const p = filePathFromArgs(tc.toolName, tc.args);
+          if (p === path && (tc.toolName === "edit" || tc.toolName === "write")) {
+            firstMutationOrder = Math.min(firstMutationOrder, order);
+          }
+          order++;
+        }
+      }
+
+      for (const read of reads) {
+        if (read.order < firstMutationOrder) {
+          discardable.add(read.toolCallId);
+        }
+      }
+    }
+
+    // Rule 2: duplicate reads — keep only the last read, discard the rest
+    if (reads.length > 1) {
+      // Sort by order, discard all but the last
+      const sorted = [...reads].sort((a, b) => a.order - b.order);
+      for (let i = 0; i < sorted.length - 1; i++) {
+        discardable.add(sorted[i].toolCallId);
+      }
+    }
+  }
+
+  return discardable;
+}
