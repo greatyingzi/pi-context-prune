@@ -328,9 +328,11 @@ export function formatFlushNotification(r: {
   skippedOversized: FlushBreakdown;
 }): string {
   const lines: string[] = [];
+  let activeCategories = 0;
 
   const s = r.summarized;
   if (s.toolCallCount > 0) {
+    activeCategories++;
     const saved = s.rawCharCount - s.summaryCharCount;
     const pct = s.rawCharCount > 0 ? Math.round((1 - s.summaryCharCount / s.rawCharCount) * 100) : 0;
     lines.push(
@@ -340,6 +342,7 @@ export function formatFlushNotification(r: {
 
   const sm = r.skippedSmall;
   if (sm.toolCallCount > 0) {
+    activeCategories++;
     lines.push(
       `  ⤏ skipped ${sm.toolCallCount} small call${sm.toolCallCount === 1 ? "" : "s"} from ${sm.batchCount} turn${sm.batchCount === 1 ? "" : "s"}: ${fmtChars(sm.rawCharCount)} chars (below threshold, kept as-is)`
     );
@@ -347,22 +350,25 @@ export function formatFlushNotification(r: {
 
   const ov = r.skippedOversized;
   if (ov.toolCallCount > 0) {
+    activeCategories++;
     lines.push(
       `  ⤏ skipped ${ov.toolCallCount} oversized call${ov.toolCallCount === 1 ? "" : "s"} from ${ov.batchCount} turn${ov.batchCount === 1 ? "" : "s"}: summary ${fmtChars(ov.summaryCharCount)} chars ≥ raw ${fmtChars(ov.rawCharCount)} chars (kept as-is)`
     );
   }
 
-  // Overall totals
-  const totalCalls = s.toolCallCount + sm.toolCallCount + ov.toolCallCount;
-  const totalBatches = s.batchCount + sm.batchCount + ov.batchCount;
-  const totalRaw = s.rawCharCount + sm.rawCharCount + ov.rawCharCount;
-  const totalSummary = s.summaryCharCount + sm.rawCharCount + ov.rawCharCount; // non-summarized keep raw
-  const totalSaved = totalRaw - totalSummary;
-  const totalPct = totalRaw > 0 ? Math.round((totalSaved / totalRaw) * 100) : 0;
+  // Only show summary line when multiple categories are present (otherwise it repeats the detail)
+  if (activeCategories > 1) {
+    const totalCalls = s.toolCallCount + sm.toolCallCount + ov.toolCallCount;
+    const totalBatches = s.batchCount + sm.batchCount + ov.batchCount;
+    const totalRaw = s.rawCharCount + sm.rawCharCount + ov.rawCharCount;
+    const totalSummary = s.summaryCharCount + sm.rawCharCount + ov.rawCharCount; // non-summarized keep raw
+    const totalSaved = totalRaw - totalSummary;
+    const totalPct = totalRaw > 0 ? Math.round((totalSaved / totalRaw) * 100) : 0;
 
-  lines.push(
-    `  ── ${totalCalls} call${totalCalls === 1 ? "" : "s"} across ${totalBatches} turn${totalBatches === 1 ? "" : "s"}: ${fmtChars(totalRaw)} → ${fmtChars(totalSummary)} chars (${totalPct}% net compression)`
-  );
+    lines.push(
+      `  ── ${totalCalls} call${totalCalls === 1 ? "" : "s"} across ${totalBatches} turn${totalBatches === 1 ? "" : "s"}: ${fmtChars(totalRaw)} → ${fmtChars(totalSummary)} chars (${totalPct}% net compression)`
+    );
+  }
 
   return `pruner: flush completed\n${lines.join("\n")}`;
 }
