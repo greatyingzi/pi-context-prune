@@ -26,7 +26,6 @@ import { registerQueryTool } from "./src/query-tool.js";
 import { registerCommands, setPruneStatusWidget } from "./src/commands.js";
 import { formatSummaryToolCallRefs, makeSummaryDetails } from "./src/summary-refs.js";
 import type { ContextPruneConfig, CapturedBatch, IndexEntryData, PruneFrontier, FlushOptions, FlushResult, SummarizeResult, FlushBreakdown } from "./src/types.js";
-import { formatFlushNotification, CUSTOM_TYPE_SUMMARY, CUSTOM_TYPE_INDEX, CUSTOM_TYPE_STATS, CUSTOM_TYPE_FRONTIER, CUSTOM_TYPE_KNOWLEDGE } from "./src/types.js";
 import {
   DEFAULT_CONFIG,
   CONTEXT_PRUNE_TOOL_NAME,
@@ -35,6 +34,8 @@ import {
   CUSTOM_TYPE_INDEX,
   CUSTOM_TYPE_STATS,
   CUSTOM_TYPE_FRONTIER,
+  CUSTOM_TYPE_KNOWLEDGE,
+  formatFlushNotification,
 } from "./src/types.js";
 import { StatsAccumulator } from "./src/stats.js";
 import { registerContextPruneTool } from "./src/context-prune-tool.js";
