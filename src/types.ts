@@ -55,6 +55,7 @@ export const CUSTOM_TYPE_STATS = "context-prune-stats";
 
 /** customType for prune-frontier persistence entries (NOT in LLM context) */
 export const CUSTOM_TYPE_FRONTIER = "context-prune-frontier";
+export const CUSTOM_TYPE_KNOWLEDGE = "context-prune-knowledge";
 
 /** Footer status widget ID */
 export const STATUS_WIDGET_ID = "context-prune";
@@ -306,6 +307,32 @@ export interface SummarizerUsage {
     total: number;
   };
 }
+
+// ── Knowledge Graph ─────────────────────────────────────────────────────────
+
+/**
+ * Structured knowledge about a single file, extracted from summarized tool results.
+ * Organized by file instead of by turn for efficient lookup.
+ */
+export interface FileKnowledge {
+  /** File path (e.g. "src/types.ts") */
+  path: string;
+  /** Exported names (functions, classes, interfaces, constants) */
+  exports: string[];
+  /** Import statements ("{ debounce } from utils") */
+  imports: string[];
+  /** Key structural elements (interface names, function signatures, class definitions) */
+  structure: string[];
+  /** Edit descriptions (what changed, why) */
+  changes: string[];
+  /** Turn index of the most recent read */
+  lastReadTurn: number;
+  /** Turn index of the most recent edit/write */
+  lastEditTurn: number;
+}
+
+/** The full knowledge graph: Map<filePath, FileKnowledge> */
+export type KnowledgeGraphMap = Map<string, FileKnowledge>;
 
 // ── Flush result ──────────────────────────────────────────────────────────────
 

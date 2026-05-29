@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { loadConfig } from "./src/config.js";
 import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode, detectDiscardableReads } from "./src/batch-capture.js";
 import { cleanToolResults as doCleanToolResults } from "./src/cleaner.js";
+import { KnowledgeGraph } from "./src/knowledge-graph.js";
 import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
 import { ToolCallIndexer } from "./src/indexer.js";
 import { pruneMessages } from "./src/pruner.js";
@@ -25,7 +26,7 @@ import { registerQueryTool } from "./src/query-tool.js";
 import { registerCommands, setPruneStatusWidget } from "./src/commands.js";
 import { formatSummaryToolCallRefs, makeSummaryDetails } from "./src/summary-refs.js";
 import type { ContextPruneConfig, CapturedBatch, IndexEntryData, PruneFrontier, FlushOptions, FlushResult, SummarizeResult, FlushBreakdown } from "./src/types.js";
-import { formatFlushNotification } from "./src/types.js";
+import { formatFlushNotification, CUSTOM_TYPE_SUMMARY, CUSTOM_TYPE_INDEX, CUSTOM_TYPE_STATS, CUSTOM_TYPE_FRONTIER, CUSTOM_TYPE_KNOWLEDGE } from "./src/types.js";
 import {
   DEFAULT_CONFIG,
   CONTEXT_PRUNE_TOOL_NAME,
@@ -54,9 +55,21 @@ export default function (pi: ExtensionAPI) {
   // Shared prune frontier — tracks the last completed prune attempt boundary
   const frontier = new PruneFrontierTracker();
 
+  // Knowledge graph — organizes file knowledge for compact context injection
+  const knowledgeGraph = new KnowledgeGraph();
+
   // Pending batches — accumulated until the prune trigger fires
   const pendingBatches: CapturedBatch[] = [];
   let isFlushing = false;
+
+  /** Extract file path from tool call args for knowledge graph. */
+  const extractFilePathForKnowledge = (toolName: string, args: Record<string, unknown>): string | undefined => {
+    if (toolName === "read" || toolName === "edit" || toolName === "write") {
+      const p = args.path ?? args.filePath;
+      return typeof p === "string" ? p : undefined;
+    }
+    return undefined;
+  };
 
   /** Get current context usage percent from Pi, or undefined. */
   const getContextPercent = (ctx: ExtensionContext): number | null | undefined => {
@@ -268,6 +281,15 @@ export default function (pi: ExtensionAPI) {
           summarizedSummaryChars += summaryText.length;
           summarizedToolCalls += batch.toolCalls.length;
           summarizedBatchesCount += 1;
+
+          // Update knowledge graph from summarized tool calls
+          for (const tc of batch.toolCalls) {
+            const filePath = extractFilePathForKnowledge(tc.toolName, tc.args);
+            if (filePath) {
+              const isEdit = tc.toolName === "edit" || tc.toolName === "write";
+              knowledgeGraph.updateFromSummary(filePath, result.summaryText, batch.turnIndex, isEdit);
+            }
+          }
         } else {
           oversizedBatches.push(batch);
           oversizedRawChars += batchRawCharCount;
@@ -535,6 +557,7 @@ export default function (pi: ExtensionAPI) {
           frontier.advance(frontierSnapshot);
           frontier.persist(pi);
           statsAccum.persist(pi);
+          knowledgeGraph.persist(pi);
         } else {
           frontier.advance(frontierSnapshot);
           appendEntry(CUSTOM_TYPE_FRONTIER, frontierSnapshot);
@@ -542,6 +565,24 @@ export default function (pi: ExtensionAPI) {
             appendEntry(CUSTOM_TYPE_STATS, statsAccum.getStats());
           } catch {
             // Ignore stats persistence failures; the prune result and frontier are the contract.
+          }
+          try {
+            appendEntry(CUSTOM_TYPE_KNOWLEDGE, knowledgeGraph.toJSON());
+          } catch {
+            // Ignore knowledge graph persistence failures
+          }
+        }
+
+        // Inject knowledge graph into context as a steer message
+        const graphText = knowledgeGraph.serialize();
+        if (graphText && delivery === "runtime") {
+          try {
+            pi.sendMessage(
+              { customType: "context-prune-knowledge", content: graphText, display: false },
+              { deliverAs: "steer" }
+            );
+          } catch {
+            // Non-critical: knowledge graph is supplementary
           }
         }
       } catch (err) {
@@ -630,11 +671,12 @@ export default function (pi: ExtensionAPI) {
     // Load config from ~/.pi/agent/context-prune/settings.json
     currentConfig.value = await loadConfig();
 
-    // Single branch scan for all three reconstructors
+    // Single branch scan for all reconstructors
     const branch = ctx.sessionManager.getBranch();
     indexer.reconstructFromSession(ctx, branch);
     statsAccum.reconstructFromSession(ctx, branch);
     frontier.reconstructFromSession(ctx, branch);
+    knowledgeGraph.reconstructFromSession(ctx, branch);
 
     // Clear any batches queued before the session reload
     pendingBatches.length = 0;
@@ -657,6 +699,7 @@ export default function (pi: ExtensionAPI) {
     indexer.reconstructFromSession(ctx, branch);
     statsAccum.reconstructFromSession(ctx, branch);
     frontier.reconstructFromSession(ctx, branch);
+    knowledgeGraph.reconstructFromSession(ctx, branch);
     // Pending batches belong to the old branch — discard them
     pendingBatches.length = 0;
   });
