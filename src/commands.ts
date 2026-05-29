@@ -3,6 +3,7 @@ import {
   type SummarizerStats,
   type CapturedBatch,
   type FlushOptions,
+  type FlushResult,
   PRUNE_ON_MODES,
   BATCHING_MODES,
   STATUS_WIDGET_ID,
@@ -345,10 +346,7 @@ function startPrunerWidget(
 export function registerCommands(
   pi: ExtensionAPI,
   currentConfig: { value: ContextPruneConfig },
-  flushPending: (ctx: ExtensionCommandContext, options?: FlushOptions) => Promise<
-    | { ok: true; reason: "flushed" | "skipped-oversized" | "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
-    | { ok: false; reason: string; error?: string }
-  >,
+  flushPending: (ctx: ExtensionCommandContext, options?: FlushOptions) => Promise<FlushResult>,
   capturePendingBatches: (ctx: ExtensionCommandContext) => CapturedBatch[],
   syncToolActivation: () => void,
   getStats: () => SummarizerStats,

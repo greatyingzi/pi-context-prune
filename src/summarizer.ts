@@ -273,62 +273,6 @@ export async function summarizeBatch(
 }
 
 /**
- * Summarizes multiple captured batches — one LLM call per batch, run in parallel.
- *
- * Returns an array of per-batch results. Each element is either a SummarizeResult
- * (success) or null (that specific batch's call failed). The array length always
- * equals batches.length so callers can zip by index.
- *
- * Rationale for parallel-per-batch instead of a single merged call:
- *   • Each batch becomes its own summary message (one per turn), so they can be
- *     rendered, browsed, and recovered independently via context_tree_query.
- *   • Parallel calls give similar end-to-end latency to a single merged call while
- *     keeping the summaries strictly separated.
- */
-export async function summarizeBatches(
-  batches: CapturedBatch[],
-  config: ContextPruneConfig,
-  ctx: ExtensionContext,
-  options: SummarizeBatchesOptions = {}
-): Promise<Array<SummarizeResult | null>> {
-  if (batches.length === 0) return [];
-  // Single batch — delegate to the single-batch path (no extra overhead)
-  if (batches.length === 1) {
-    return [
-      await summarizeBatch(batches[0], config, ctx, {
-        signal: options.signal,
-        onTextProgress: (receivedChars) => {
-          options.onBatchTextProgress?.(0, 1, batches[0], receivedChars);
-        },
-      }),
-    ];
-  }
-
-  // Multiple batches — run in parallel; each produces its own SummarizeResult
-  return Promise.all(
-    batches.map((batch, index) =>
-      summarizeBatch(batch, config, ctx, {
-        signal: options.signal,
-        onTextProgress: (receivedChars) => {
-          options.onBatchTextProgress?.(index, batches.length, batch, receivedChars);
-        },
-      })
-    )
-  );
-}
-
-/**
- * Summarizes all batches using structured JSON LLM calls with at most 3 parallel groups.
- *
- * Batches are split into chunks of ~3, and each chunk is summarized
- * independently. For small chunks (≤1 batch) the simple path is used;
- * for larger chunks all batches are sent in one call and the LLM
- * returns concatenated summaries separated by a known delimiter.
- *
- * This replaces the previous fragile structured-JSON single-call approach.
- * Chunked parallel calls are more reliable and scale better.
- */
-/**
  * Summarizes all batches using at most MAX_GROUPS parallel structured JSON LLM calls.
  *
  * Algorithm:

@@ -9,7 +9,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { CapturedBatch, FlushOptions } from "./types.js";
+import type { CapturedBatch, FlushOptions, FlushResult } from "./types.js";
 import { CONTEXT_PRUNE_TOOL_NAME } from "./types.js";
 import { pruneProgressText } from "./progress-text.js";
 
@@ -20,11 +20,6 @@ import { pruneProgressText } from "./progress-text.js";
  * @param pi      Extension API for tool registration
  * @param flushPending  Shared flush function that summarizes + indexes pending batches
  */
-type FlushResult =
-  | { ok: true; reason: "flushed"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
-  | { ok: true; reason: "skipped-oversized"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
-  | { ok: true; reason: "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
-  | { ok: false; reason: string; error?: string };
 
 function sendToolProgress(
   onUpdate: AgentToolUpdateCallback<unknown> | undefined,

@@ -1,26 +1,6 @@
-import type { SummarizerStats } from "./types.js";
+import type { SummarizerStats, SummarizerUsage } from "./types.js";
 import { CUSTOM_TYPE_STATS } from "./types.js";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-
-/**
- * Usage shape returned by the LLM `complete()` call.
- * Mirrors the `Usage` interface from `@mariozechner/pi-ai` but declared locally
- * so we don't need a runtime import just for the type.
- */
-interface Usage {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  totalTokens: number;
-  cost: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    total: number;
-  };
-}
 
 /**
  * Accumulates cumulative token/cost stats for summarizer LLM calls.
@@ -36,7 +16,7 @@ export class StatsAccumulator {
   };
 
   /** Add usage data from one summarizer LLM call. */
-  add(usage: Usage): void {
+  add(usage: SummarizerUsage): void {
     this.stats.totalInputTokens += usage.input ?? 0;
     this.stats.totalOutputTokens += usage.output ?? 0;
     this.stats.totalCost += usage.cost?.total ?? 0;
@@ -76,11 +56,12 @@ export class StatsAccumulator {
   /**
    * Reconstruct stats from session history by scanning all custom entries
    * with customType === CUSTOM_TYPE_STATS.
+   * Accepts an optional pre-fetched branch to avoid redundant scans.
    */
-  reconstructFromSession(ctx: ExtensionContext): void {
+  reconstructFromSession(ctx: ExtensionContext, branch?: any[]): void {
     this.reset();
-    const branch = ctx.sessionManager.getBranch();
-    for (const entry of branch) {
+    const entries = branch ?? ctx.sessionManager.getBranch();
+    for (const entry of entries) {
       if (
         entry.type === "custom" &&
         (entry as any).customType === CUSTOM_TYPE_STATS

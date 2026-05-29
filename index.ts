@@ -13,7 +13,7 @@
  * Usage:  pi -e .
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./src/config.js";
 import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode } from "./src/batch-capture.js";
 import { summarizeBatch, summarizeAllBatches } from "./src/summarizer.js";
@@ -23,7 +23,7 @@ import { annotateWithUnprunedCount, countUnprunedToolCalls } from "./src/reminde
 import { registerQueryTool } from "./src/query-tool.js";
 import { registerCommands, setPruneStatusWidget } from "./src/commands.js";
 import { formatSummaryToolCallRefs, makeSummaryDetails } from "./src/summary-refs.js";
-import type { ContextPruneConfig, CapturedBatch, IndexEntryData, PruneFrontier, FlushOptions } from "./src/types.js";
+import type { ContextPruneConfig, CapturedBatch, IndexEntryData, PruneFrontier, FlushOptions, FlushResult, SummarizeResult } from "./src/types.js";
 import {
   DEFAULT_CONFIG,
   CONTEXT_PRUNE_TOOL_NAME,
@@ -56,23 +56,139 @@ export default function (pi: ExtensionAPI) {
   const pendingBatches: CapturedBatch[] = [];
   let isFlushing = false;
 
-  type FlushResult =
-    | { ok: true; reason: "flushed" | "skipped-oversized" | "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
-    | { ok: false; reason: "empty" | "already-flushing" | "summarizer-failed" | "stale-context" | "failed" | "aborted"; error?: string };
+  // ── Small-batch classification ───────────────────────────────────────────
 
-  // Small tool results are usually not worth an LLM summarization call: the
-  // summary can be larger than the raw output, and the fixed LLM latency/cost is
-  // pure overhead. These batches advance the frontier so they are not retried.
+  /** Raw content threshold below which batches skip LLM summarization entirely. */
   const MIN_BATCH_RAW_CHARS_TO_SUMMARIZE = 800;
 
+  /** Total raw characters across all tool calls in a batch. */
   const rawCharCount = (batch: CapturedBatch) => batch.toolCalls.reduce((s, tc) => s + tc.resultText.length, 0);
 
+  /** Whether a batch is too small to be worth an LLM summarization call. */
   const shouldSkipSmallBatch = (batch: CapturedBatch) => rawCharCount(batch) < MIN_BATCH_RAW_CHARS_TO_SUMMARIZE;
 
+  /** Format a list of turn indices for aggregate notifications. */
   const formatTurnList = (batches: CapturedBatch[], max = 12) => {
     const turns = batches.slice(0, max).map((b) => b.turnIndex).join(", ");
     return batches.length > max ? `${turns}, …` : turns;
   };
+
+  /**
+   * Classify batches into small (skip LLM) and summarizable (send to LLM).
+   * Returns indices for each category, preserving original batch order.
+   */
+  const classifyBatches = (batches: CapturedBatch[]) => {
+    const smallBatchIndexes = new Set<number>();
+    const summarizableBatches: { batch: CapturedBatch; originalIndex: number }[] = [];
+    batches.forEach((batch, index) => {
+      if (shouldSkipSmallBatch(batch)) {
+        smallBatchIndexes.add(index);
+      } else {
+        summarizableBatches.push({ batch, originalIndex: index });
+      }
+    });
+    return { smallBatchIndexes, summarizableBatches };
+  };
+
+  // ── Result processing ──────────────────────────────────────────────────────
+
+  /**
+   * Process summarization results, persist summaries, advance frontier.
+   * Returns the processed batch count, tool call count, and frontier outcome.
+   */
+  const processResults = (
+    batches: CapturedBatch[],
+    results: Array<SummarizeResult | null | undefined>,
+    smallBatchIndexes: Set<number>,
+    delivery: "runtime" | "session",
+    appendEntry: (customType: string, data?: unknown) => void,
+    appendSummaryMessage: (content: string, details: unknown) => void,
+    ctx: ExtensionContext,
+  ): {
+    processedBatches: CapturedBatch[];
+    smallBatches: CapturedBatch[];
+    oversizedBatches: CapturedBatch[];
+    summarizedBatches: CapturedBatch[];
+    totalRawCharCount: number;
+    totalSummaryCharCount: number;
+    totalToolCallCount: number;
+    firstFailureIndex: number;
+  } => {
+    const processedBatches: CapturedBatch[] = [];
+    let totalRawCharCount = 0;
+    let totalSummaryCharCount = 0;
+    let totalToolCallCount = 0;
+    const smallBatches: CapturedBatch[] = [];
+    const oversizedBatches: CapturedBatch[] = [];
+    const summarizedBatches: CapturedBatch[] = [];
+    let firstFailureIndex = -1;
+
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const batchRawCharCount = rawCharCount(batch);
+
+      if (smallBatchIndexes.has(i)) {
+        totalRawCharCount += batchRawCharCount;
+        totalToolCallCount += batch.toolCalls.length;
+        smallBatches.push(batch);
+        processedBatches.push(batch);
+        continue;
+      }
+
+      const result = results[i];
+      if (!result) {
+        firstFailureIndex = i;
+        break;
+      }
+
+      totalRawCharCount += batchRawCharCount;
+      totalToolCallCount += batch.toolCalls.length;
+
+      const summaryRefs = indexer.allocateSummaryRefs(batch);
+      const summaryText = result.summaryText + formatSummaryToolCallRefs(summaryRefs);
+      const shouldSkipOversized = summaryText.length > batchRawCharCount;
+
+      statsAccum.add(result.usage);
+      totalSummaryCharCount += summaryText.length;
+
+      const batchDetails = makeSummaryDetails(batch, summaryRefs);
+
+      try {
+        if (!shouldSkipOversized) {
+          if (delivery === "runtime") {
+            pi.sendMessage(
+              { customType: CUSTOM_TYPE_SUMMARY, content: summaryText, display: true, details: batchDetails },
+              { deliverAs: "steer" }
+            );
+            indexer.registerSummaryRefs(summaryRefs);
+            indexer.addBatch(batch, pi);
+          } else {
+            appendSummaryMessage(summaryText, batchDetails);
+            indexer.registerSummaryRefs(summaryRefs);
+            persistBatchIndex(batch, appendEntry);
+          }
+          summarizedBatches.push(batch);
+        } else {
+          oversizedBatches.push(batch);
+        }
+      } catch (err) {
+        if (isStaleContextError(err)) {
+          restoreBatches(batches.slice(i));
+          break;
+        }
+        throw err;
+      }
+
+      processedBatches.push(batch);
+    }
+
+    return {
+      processedBatches, smallBatches, oversizedBatches, summarizedBatches,
+      totalRawCharCount, totalSummaryCharCount, totalToolCallCount, firstFailureIndex,
+    };
+  };
+
+  // ── flushPending ────────────────────────────────────────────────────────
 
   type SessionAppender = {
     appendCustomEntry(customType: string, data?: unknown): string;
@@ -84,7 +200,7 @@ export default function (pi: ExtensionAPI) {
 
   const errorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-  const safeNotify = (ctx: any, message: string, type: "info" | "warning" | "error" = "info") => {
+  const safeNotify = (ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info") => {
     try {
       ctx.ui.notify(message, type);
     } catch (err) {
@@ -148,7 +264,7 @@ export default function (pi: ExtensionAPI) {
   // ── Helper: capture + trim + group pending batches (no LLM work) ──────────
   // Exposed to commands.ts via registerCommands so /pruner now can preview the
   // queue before opening the multi-row progress overlay.
-  const capturePendingBatches = (ctx: any): CapturedBatch[] => {
+  const capturePendingBatches = (ctx: ExtensionContext): CapturedBatch[] => {
     let batches: CapturedBatch[] = [];
     try {
       const branch = ctx.sessionManager.getBranch();
@@ -170,7 +286,7 @@ export default function (pi: ExtensionAPI) {
   // steer messages at protocol-safe boundaries. Session delivery is used only for
   // agent-message's final-message flush, where print-mode Pi may invalidate pi.*
   // while the summarizer LLM call is in flight.
-  const flushPending = async (ctx: any, options: FlushOptions = {}): Promise<FlushResult> => {
+  const flushPending = async (ctx: ExtensionContext, options: FlushOptions = {}): Promise<FlushResult> => {
     if (isFlushing) return { ok: false, reason: "already-flushing" };
 
     // Use pre-captured batches if provided (avoids double-capture when the
@@ -212,24 +328,14 @@ export default function (pi: ExtensionAPI) {
         options.onBatchTextProgress?.(index, total, batch, receivedChars);
       };
 
-      // Classify tiny batches before any LLM work. They are not worth
-      // summarizing because the summary often exceeds the raw content. We still
-      // process them below so the frontier advances and they are not retried.
-      const smallBatchIndexes = new Set<number>();
-      const summarizableBatches: { batch: CapturedBatch; originalIndex: number }[] = [];
-      batches.forEach((batch, index) => {
-        if (shouldSkipSmallBatch(batch)) {
-          smallBatchIndexes.add(index);
-        } else {
-          summarizableBatches.push({ batch, originalIndex: index });
-        }
-      });
+      // Classify tiny batches before any LLM work.
+      const { smallBatchIndexes, summarizableBatches } = classifyBatches(batches);
 
       // Summarize only batches that clear the minimum raw-size threshold. When
       // onProgress is provided (i.e. /pruner now with the multi-row overlay), we
       // process sequentially so each row can be checked off as its LLM call
       // completes; small rows are marked skipped without an LLM call.
-      const results: Array<import("./src/types.js").SummarizeResult | null | undefined> = new Array(batches.length);
+      const results: Array<SummarizeResult | null | undefined> = new Array(batches.length);
       if (options.onProgress) {
         for (let i = 0; i < batches.length; i++) {
           options.onProgress(i, batches.length, batches[i], "start");
@@ -247,7 +353,6 @@ export default function (pi: ExtensionAPI) {
           options.onProgress(i, batches.length, batches[i], r ? "done" : "skipped");
         }
       } else if (summarizableBatches.length > 0) {
-        // Structured multi-batch summarization only sees worthwhile candidates.
         const summarizedResults = await summarizeAllBatches(
           summarizableBatches.map((entry) => entry.batch),
           currentConfig.value,
@@ -268,97 +373,25 @@ export default function (pi: ExtensionAPI) {
       // Process results in original order; stop at first null for a summarizable
       // batch (LLM failure). Batches before the first failure are persisted or
       // frontier-skipped; remaining are restored for retry.
-      const processedBatches: CapturedBatch[] = [];
-      let totalRawCharCount = 0;
-      let totalSummaryCharCount = 0;
-      let totalToolCallCount = 0;
-      const smallBatches: CapturedBatch[] = [];
-      const oversizedBatches: CapturedBatch[] = [];
-      const summarizedBatches: CapturedBatch[] = [];
-      let firstFailureIndex = -1;
-
-      for (let i = 0; i < batches.length; i++) {
-        const batch = batches[i];
-        const batchRawCharCount = rawCharCount(batch);
-
-        if (smallBatchIndexes.has(i)) {
-          // Tiny results are intentionally not summarized or indexed. Advancing
-          // the frontier is enough to avoid repeated LLM attempts for them.
-          totalRawCharCount += batchRawCharCount;
-          totalToolCallCount += batch.toolCalls.length;
-          smallBatches.push(batch);
-          processedBatches.push(batch);
-          continue;
-        }
-
-        const result = results[i];
-        if (!result) {
-          firstFailureIndex = i;
-          break;
-        }
-
-        totalRawCharCount += batchRawCharCount;
-        totalToolCallCount += batch.toolCalls.length;
-
-        const summaryRefs = indexer.allocateSummaryRefs(batch);
-        const summaryText = result.summaryText + formatSummaryToolCallRefs(summaryRefs);
-        const shouldSkipOversized = summaryText.length > batchRawCharCount;
-
-        statsAccum.add(result.usage);
-        totalSummaryCharCount += summaryText.length;
-
-        const batchDetails = makeSummaryDetails(batch, summaryRefs);
-
-        try {
-          if (!shouldSkipOversized) {
-            // Write one summary message per turn and index its tool calls.
-            if (delivery === "runtime") {
-              pi.sendMessage(
-                { customType: CUSTOM_TYPE_SUMMARY, content: summaryText, display: true, details: batchDetails },
-                { deliverAs: "steer" }
-              );
-              indexer.registerSummaryRefs(summaryRefs);
-              indexer.addBatch(batch, pi);
-            } else {
-              appendSummaryMessage(summaryText, batchDetails);
-              indexer.registerSummaryRefs(summaryRefs);
-              persistBatchIndex(batch, appendEntry);
-            }
-            summarizedBatches.push(batch);
-          } else {
-            oversizedBatches.push(batch);
-          }
-        } catch (err) {
-          // Persistence error mid-loop: stop here, restore this and remaining batches.
-          if (isStaleContextError(err)) {
-            restoreBatches(batches.slice(i));
-            // Advance frontier to what we managed to persist before this point
-            break;
-          }
-          throw err;
-        }
-
-        processedBatches.push(batch);
-      }
+      const proc = processResults(batches, results, smallBatchIndexes, delivery, appendEntry, appendSummaryMessage, ctx);
 
       // Restore unprocessed batches (those at and after the first failure)
-      if (firstFailureIndex >= 0) {
-        restoreBatches(batches.slice(firstFailureIndex));
+      if (proc.firstFailureIndex >= 0) {
+        restoreBatches(batches.slice(proc.firstFailureIndex));
       }
 
-      if (processedBatches.length === 0) {
-        // Nothing was persisted (all calls failed or first call failed)
+      if (proc.processedBatches.length === 0) {
         setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
         return { ok: false, reason: "summarizer-failed" };
       }
 
       // Advance frontier to the last batch we actually processed.
-      const lastBatch = processedBatches[processedBatches.length - 1];
+      const lastBatch = proc.processedBatches[proc.processedBatches.length - 1];
       const lastTC = lastBatch.toolCalls[lastBatch.toolCalls.length - 1];
       const frontierOutcome: PruneFrontier["outcome"] =
-        summarizedBatches.length > 0
+        proc.summarizedBatches.length > 0
           ? "summarized"
-          : oversizedBatches.length > 0
+          : proc.oversizedBatches.length > 0
             ? "skipped-oversized"
             : "skipped-small";
       const frontierSnapshot: PruneFrontier = {
@@ -366,10 +399,10 @@ export default function (pi: ExtensionAPI) {
         lastAttemptedToolName: lastTC.toolName,
         lastAttemptedTurnIndex: lastBatch.turnIndex,
         lastAttemptedTimestamp: lastBatch.timestamp,
-        attemptedBatchCount: processedBatches.length,
-        attemptedToolCallCount: totalToolCallCount,
-        rawCharCount: totalRawCharCount,
-        summaryCharCount: totalSummaryCharCount,
+        attemptedBatchCount: proc.processedBatches.length,
+        attemptedToolCallCount: proc.totalToolCallCount,
+        rawCharCount: proc.totalRawCharCount,
+        summaryCharCount: proc.totalSummaryCharCount,
         outcome: frontierOutcome,
       };
 
@@ -393,18 +426,18 @@ export default function (pi: ExtensionAPI) {
 
       setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
 
-      if (smallBatches.length > 0) {
+      if (proc.smallBatches.length > 0) {
         safeNotify(
           ctx,
-          `pruner: skipped ${smallBatches.length} small turn(s) (${formatTurnList(smallBatches)}) — raw output under ${MIN_BATCH_RAW_CHARS_TO_SUMMARIZE} chars`,
+          `pruner: skipped ${proc.smallBatches.length} small turn(s) (${formatTurnList(proc.smallBatches)}) — raw output under ${MIN_BATCH_RAW_CHARS_TO_SUMMARIZE} chars`,
           "info"
         );
       }
 
-      if (oversizedBatches.length > 0) {
+      if (proc.oversizedBatches.length > 0) {
         safeNotify(
           ctx,
-          `pruner: skipped ${oversizedBatches.length} oversized turn(s) (${formatTurnList(oversizedBatches)}) — summary(s) larger than raw content`,
+          `pruner: skipped ${proc.oversizedBatches.length} oversized turn(s) (${formatTurnList(proc.oversizedBatches)}) — summary(s) larger than raw content`,
           "info"
         );
       }
@@ -412,15 +445,13 @@ export default function (pi: ExtensionAPI) {
       return {
         ok: true,
         reason: frontierOutcome === "summarized" ? "flushed" : frontierOutcome,
-        batchCount: processedBatches.length,
-        toolCallCount: totalToolCallCount,
-        rawCharCount: totalRawCharCount,
-        summaryCharCount: totalSummaryCharCount,
+        batchCount: proc.processedBatches.length,
+        toolCallCount: proc.totalToolCallCount,
+        rawCharCount: proc.totalRawCharCount,
+        summaryCharCount: proc.totalSummaryCharCount,
       };
     } catch (err) {
       restoreBatches(batches);
-      // When the abort signal fired, summarizeBatch rethrows rather than
-      // swallowing the error.  Don't show a UI error — the user intended this.
       if (options.signal?.aborted) {
         setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
         return { ok: false, reason: "aborted" };
@@ -457,14 +488,11 @@ export default function (pi: ExtensionAPI) {
     // Load config from ~/.pi/agent/context-prune/settings.json
     currentConfig.value = await loadConfig();
 
-    // Rebuild in-memory index from persisted session entries
-    indexer.reconstructFromSession(ctx);
-
-    // Rebuild stats accumulator from persisted session entries
-    statsAccum.reconstructFromSession(ctx);
-
-    // Rebuild prune frontier from persisted session entries
-    frontier.reconstructFromSession(ctx);
+    // Single branch scan for all three reconstructors
+    const branch = ctx.sessionManager.getBranch();
+    indexer.reconstructFromSession(ctx, branch);
+    statsAccum.reconstructFromSession(ctx, branch);
+    frontier.reconstructFromSession(ctx, branch);
 
     // Clear any batches queued before the session reload
     pendingBatches.length = 0;
@@ -483,9 +511,10 @@ export default function (pi: ExtensionAPI) {
 
   // Rebuild index and stats after tree navigation too (branch may have different history)
   pi.on("session_tree", async (_event, ctx) => {
-    indexer.reconstructFromSession(ctx);
-    statsAccum.reconstructFromSession(ctx);
-    frontier.reconstructFromSession(ctx);
+    const branch = ctx.sessionManager.getBranch();
+    indexer.reconstructFromSession(ctx, branch);
+    statsAccum.reconstructFromSession(ctx, branch);
+    frontier.reconstructFromSession(ctx, branch);
     // Pending batches belong to the old branch — discard them
     pendingBatches.length = 0;
   });

@@ -20,11 +20,16 @@ export function captureBatch(
     .join("\n")
     .trim();
 
-  // Collect tool calls, matching each to its result
+  // Collect tool calls, matching each to its result via Map (O(1) lookup)
+  const resultMap = new Map<string, any>();
+  for (const result of toolResults) {
+    if (result?.toolCallId) resultMap.set(result.toolCallId, result);
+  }
+
   const toolCalls: CapturedToolCall[] = content
     .filter((block: any) => block.type === "toolCall")
     .map((block: any) => {
-      const match = toolResults.find((result: any) => result.toolCallId === block.id);
+      const match = resultMap.get(block.id);
 
       let resultText = "(no result)";
       let isError = false;
@@ -163,20 +168,6 @@ export function serializeBatchForSummarizer(batch: CapturedBatch): string {
   parts.push(toolParts.join("\n---\n"));
 
   return parts.join("\n");
-}
-
-/**
- * Serializes multiple CapturedBatches into a single readable text block for the summarizer LLM.
- * Each batch is rendered as a separate "Turn" section with a header indicating the turn index.
- */
-export function serializeBatchesForSummarizer(batches: CapturedBatch[]): string {
-  return batches
-    .map((batch, i) => {
-      const header = `=== Turn ${batch.turnIndex}${i > 0 ? ` (batch ${i + 1})` : ""} ===`;
-      const body = serializeBatchForSummarizer(batch);
-      return `${header}\n${body}`;
-    })
-    .join("\n\n");
 }
 
 /**

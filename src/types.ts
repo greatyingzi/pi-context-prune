@@ -283,6 +283,40 @@ export interface SummarizerStats {
   callCount: number;
 }
 
+// ── Summarizer usage ─────────────────────────────────────────────────────────
+
+/**
+ * Usage shape returned by the LLM `complete()` / `stream()` call.
+ * Mirrors the `Usage` interface from `@mariozechner/pi-ai` but declared locally
+ * so we don't need a runtime import just for the type.
+ */
+export interface SummarizerUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
+}
+
+// ── Flush result ──────────────────────────────────────────────────────────────
+
+/**
+ * Result returned by `flushPending()`.
+ * Single source of truth — shared by `index.ts`, `commands.ts`, and `context-prune-tool.ts`.
+ */
+export type FlushResult =
+  | { ok: true; reason: "flushed" | "skipped-oversized" | "skipped-small"; batchCount: number; toolCallCount: number; rawCharCount: number; summaryCharCount: number }
+  | { ok: false; reason: "empty" | "already-flushing" | "summarizer-failed" | "stale-context" | "failed" | "aborted"; error?: string };
+
+// ── Prune frontier ────────────────────────────────────────────────────────────
+
 /** Outcome of the most recent completed prune attempt. */
 export type PruneFrontierOutcome = "summarized" | "skipped-oversized" | "skipped-small";
 
@@ -374,7 +408,7 @@ export interface SummarizeBatchOptions {
   signal?: AbortSignal;
 }
 
-/** Options for summarizeBatches() and summarizeAllBatches() when callers want live text progress. */
+/** Options for summarizeAllBatches() when callers want live text progress. */
 export interface SummarizeBatchesOptions {
   /** Receives streamed summary text character counts for each batch. */
   onBatchTextProgress?: BatchTextProgressCallback;
@@ -391,18 +425,5 @@ export interface SummarizeBatchesOptions {
 export interface SummarizeResult {
   summaryText: string;
   /** Usage data from the LLM response (tokens + cost) */
-  usage: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    totalTokens: number;
-    cost: {
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-      total: number;
-    };
-  };
+  usage: SummarizerUsage;
 }

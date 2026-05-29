@@ -35,10 +35,10 @@ export class PruneFrontierTracker {
     };
   }
 
-  reconstructFromSession(ctx: ExtensionContext): void {
+  reconstructFromSession(ctx: ExtensionContext, branch?: any[]): void {
     this.reset();
-    const branch = ctx.sessionManager.getBranch();
-    for (const entry of branch) {
+    const entries = branch ?? ctx.sessionManager.getBranch();
+    for (const entry of entries) {
       if (
         entry.type === "custom" &&
         (entry as any).customType === CUSTOM_TYPE_FRONTIER

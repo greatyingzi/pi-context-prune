@@ -15,14 +15,15 @@ export class ToolCallIndexer {
   /**
    * Rebuilds the in-memory index from session history by scanning all
    * custom entries with customType === CUSTOM_TYPE_INDEX.
+   * Accepts an optional pre-fetched branch to avoid redundant scans.
    */
-  reconstructFromSession(ctx: ExtensionContext): void {
+  reconstructFromSession(ctx: ExtensionContext, branch?: any[]): void {
     this.index.clear();
     this.aliasToToolCallId.clear();
     this.nextShortAliasNumber = 1;
 
-    const branch = ctx.sessionManager.getBranch();
-    for (const entry of branch) {
+    const entries = branch ?? ctx.sessionManager.getBranch();
+    for (const entry of entries) {
       if (entry.type === "custom" && (entry as any).customType === CUSTOM_TYPE_INDEX) {
         const data = (entry as any).data as IndexEntryData;
         if (data && Array.isArray(data.toolCalls)) {
