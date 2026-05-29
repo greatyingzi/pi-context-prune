@@ -275,58 +275,90 @@ function filePathFromArgs(toolName: string, args: Record<string, unknown>): stri
 export function detectDiscardableReads(batches: CapturedBatch[]): Set<string> {
   const discardable = new Set<string>();
 
-  // Pass 1: collect all file-mutating operations (edit/write) by path
-  // and all read operations by path, with their turn order index
-  const mutatedFiles = new Set<string>();
-  const readsByPath = new Map<string, Array<{ toolCallId: string; order: number }>>();
-
+  // Collect all tool calls with their file paths in chronological order
+  interface FileOp {
+    toolCallId: string;
+    toolName: string;
+    path: string;
+    order: number;
+  }
+  const ops: FileOp[] = [];
   let order = 0;
   for (const batch of batches) {
     for (const tc of batch.toolCalls) {
       const path = filePathFromArgs(tc.toolName, tc.args);
-      if (!path) { order++; continue; }
-
-      if (tc.toolName === "edit" || tc.toolName === "write") {
-        mutatedFiles.add(path);
-      } else if (tc.toolName === "read") {
-        if (!readsByPath.has(path)) readsByPath.set(path, []);
-        readsByPath.get(path)!.push({ toolCallId: tc.toolCallId, order });
+      if (path) {
+        ops.push({ toolCallId: tc.toolCallId, toolName: tc.toolName, path, order });
       }
       order++;
     }
   }
 
-  // Pass 2: apply discard rules
-  for (const [path, reads] of readsByPath) {
-    // Rule 1: stale reads — if file was mutated, all reads before the first mutation are stale
-    if (mutatedFiles.has(path)) {
-      // Find the first edit/write order for this path
-      let firstMutationOrder = Infinity;
-      order = 0;
-      for (const batch of batches) {
-        for (const tc of batch.toolCalls) {
-          const p = filePathFromArgs(tc.toolName, tc.args);
-          if (p === path && (tc.toolName === "edit" || tc.toolName === "write")) {
-            firstMutationOrder = Math.min(firstMutationOrder, order);
-          }
-          order++;
-        }
-      }
+  // Group ops by file path
+  const opsByPath = new Map<string, FileOp[]>();
+  for (const op of ops) {
+    if (!opsByPath.has(op.path)) opsByPath.set(op.path, []);
+    opsByPath.get(op.path)!.push(op);
+  }
 
-      for (const read of reads) {
-        if (read.order < firstMutationOrder) {
-          discardable.add(read.toolCallId);
+  // For each file: split into segments at each edit/write boundary.
+  // Within each segment, keep only the LAST read.
+  // All reads in segments BEFORE a mutation are stale (the content changed).
+  // Reads in the FINAL segment (no mutation after) are all kept — we can't
+  // assume they're stale since nothing changed the file.
+  for (const [_path, fileOps] of opsByPath) {
+    // Find mutation indices
+    const mutationIndices: number[] = [];
+    fileOps.forEach((op, i) => {
+      if (op.toolName === "edit" || op.toolName === "write") {
+        mutationIndices.push(i);
+      }
+    });
+
+    if (mutationIndices.length === 0) {
+      // No mutations — file was only read, never modified.
+      // Only apply duplicate rule: if read N times, keep only the last.
+      const reads = fileOps.filter((op) => op.toolName === "read");
+      if (reads.length > 1) {
+        for (let i = 0; i < reads.length - 1; i++) {
+          discardable.add(reads[i].toolCallId);
         }
       }
+      continue;
     }
 
-    // Rule 2: duplicate reads — keep only the last read, discard the rest
-    if (reads.length > 1) {
-      // Sort by order, discard all but the last
-      const sorted = [...reads].sort((a, b) => a.order - b.order);
-      for (let i = 0; i < sorted.length - 1; i++) {
-        discardable.add(sorted[i].toolCallId);
+    // Split into segments: before first mutation, between mutations, after last mutation
+    // Each segment: keep only the last read within it
+    // Pre-mutation segments: all reads are stale (content was overwritten)
+    // Post-mutation segments: keep the last read, discard earlier ones in same segment
+    const lastMutationIdx = mutationIndices[mutationIndices.length - 1];
+
+    // Collect reads by segment
+    let segmentStart = 0;
+    const mutationBoundaries = [...mutationIndices];
+    // Add sentinel at end
+    mutationBoundaries.push(fileOps.length);
+
+    for (let b = 0; b < mutationBoundaries.length; b++) {
+      const boundary = mutationBoundaries[b];
+      const segmentOps = fileOps.slice(segmentStart, boundary);
+      const segmentReads = segmentOps.filter((op) => op.toolName === "read");
+      const isPreMutation = b < mutationIndices.length; // before the last mutation
+
+      // In every segment, keep only the last read
+      if (segmentReads.length > 1) {
+        for (let i = 0; i < segmentReads.length - 1; i++) {
+          discardable.add(segmentReads[i].toolCallId);
+        }
       }
+
+      // If this segment is before a mutation, even the last read is stale
+      // (unless it's the very last segment — after all mutations — where we keep it)
+      if (isPreMutation && segmentReads.length > 0) {
+        discardable.add(segmentReads[segmentReads.length - 1].toolCallId);
+      }
+
+      segmentStart = boundary;
     }
   }
 
