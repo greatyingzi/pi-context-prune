@@ -10,6 +10,7 @@ import type {
   SummarizeResult,
   StructuredFileInfo,
 } from "./types.js";
+import { MAX_STRUCTURED_INPUT_CHARS } from "./types.js";
 import { serializeBatchForSummarizer, serializeAllBatchesForStructured } from "./batch-capture.js";
 
 const SYSTEM_PROMPT = `You are summarizing tool calls made by an AI coding assistant.
@@ -136,11 +137,102 @@ function splitIntoGroups<T>(items: T[], groupCount: number): T[][] {
 }
 
 /**
+ * Estimate the approximate input character count for a batch group.
+ * Accounts for result text + args, plus serialization overhead (XML tags, prompts).
+ */
+function estimateGroupChars(group: CapturedBatch[]): number {
+  return group.reduce((sum, batch) => {
+    return sum + batch.toolCalls.reduce(
+      (s, tc) => s + tc.resultText.length + JSON.stringify(tc.args).length,
+      0
+    );
+  }, 0)
+    // Add ~500 chars overhead per batch for XML delimiters and serialization
+    + group.length * 500;
+}
+
+/**
+ * Result from processing one group of batches via the structured JSON path.
+ * Carries both the per-batch summary results and the extracted file knowledge
+ * so callers can merge across parallel groups instead of relying on the
+ * global side-channel.
+ */
+interface GroupProcessResult {
+  results: Array<SummarizeResult | null>;
+  files: StructuredFileInfo[];
+}
+
+/**
+ * Attempt to process a group — either directly via summarizeGroup, or by
+ * splitting into smaller sub-groups if the estimated input exceeds the threshold.
+ * Preserves the retry loop semantics of summarizeAllBatches.
+ * When splitting, accumulates StructuredFileInfo from each sub-group.
+ */
+async function processGroup(
+  group: CapturedBatch[],
+  config: ContextPruneConfig,
+  ctx: ExtensionContext,
+  allBatches: CapturedBatch[],
+  options: SummarizeBatchesOptions,
+): Promise<GroupProcessResult> {
+  // If the group is oversized, split into halves and process sequentially.
+  const inputEst = estimateGroupChars(group);
+  if (group.length > 1 && inputEst > MAX_STRUCTURED_INPUT_CHARS) {
+    const mid = Math.ceil(group.length / 2);
+    const left = group.slice(0, mid);
+    const right = group.slice(mid);
+    const leftOut = await processGroup(left, config, ctx, allBatches, options);
+    const rightOut = await processGroup(right, config, ctx, allBatches, options);
+    return {
+      results: leftOut.results.concat(rightOut.results),
+      files: mergeStructuredFiles(leftOut.files, rightOut.files),
+    };
+  }
+
+  return await summarizeGroup(group, config, ctx, allBatches, options);
+}
+
+/**
+ * Merge StructuredFileInfo arrays from two partial LLM extractions.
+ * Entries are deduplicated by file path (later entries win for changes,
+ * but exports/imports/structure/tags are unioned).
+ */
+function mergeStructuredFiles(a: StructuredFileInfo[], b: StructuredFileInfo[]): StructuredFileInfo[] {
+  const map = new Map<string, StructuredFileInfo>();
+  for (const f of a) {
+    map.set(f.path, f);
+  }
+  for (const f of b) {
+    const existing = map.get(f.path);
+    if (existing) {
+      // Union exports, imports, structure, tags (dedup each)
+      const merged: StructuredFileInfo = {
+        path: f.path,
+        exports: [...new Set([...existing.exports, ...f.exports])],
+        imports: [...new Set([...existing.imports, ...f.imports])],
+        structure: [...new Set([...existing.structure, ...f.structure])],
+        changes: [...new Set([...existing.changes, ...f.changes])],
+        tags: [...new Set([...existing.tags, ...f.tags])],
+      };
+      map.set(f.path, merged);
+    } else {
+      map.set(f.path, f);
+    }
+  }
+  return Array.from(map.values());
+}
+
+/**
  * Attempts to parse the LLM response as structured JSON.
  * Tries: raw JSON → strip markdown fences → strip trailing comma → give up.
  * Returns null if parsing fails after all attempts.
+ * Returns { summaries, files } so callers can directly extract both without
+ * relying on the global _lastParsedFiles side-channel.
  */
-function tryParseStructuredJson(text: string): { turnIndex: number; summaryText: string }[] | null {
+function tryParseStructuredJson(text: string): {
+  summaries: { turnIndex: number; summaryText: string }[];
+  files: StructuredFileInfo[];
+} | null {
   let candidate = text.trim();
 
   // Strip markdown code fences if present
@@ -151,11 +243,10 @@ function tryParseStructuredJson(text: string): { turnIndex: number; summaryText:
   try {
     const obj = JSON.parse(candidate);
     if (obj && Array.isArray(obj.summaries)) {
-      // Attach files data to the parsed result via a side channel
-      if (Array.isArray(obj.files)) {
-        try { _lastParsedFiles = obj.files; } catch {}
-      }
-      return obj.summaries;
+      return {
+        summaries: obj.summaries,
+        files: Array.isArray(obj.files) ? obj.files : [],
+      };
     }
   } catch {}
 
@@ -164,10 +255,10 @@ function tryParseStructuredJson(text: string): { turnIndex: number; summaryText:
     const fixed = candidate.replace(/,\s*([}\]])/g, "$1");
     const obj = JSON.parse(fixed);
     if (obj && Array.isArray(obj.summaries)) {
-      if (Array.isArray(obj.files)) {
-        try { _lastParsedFiles = obj.files; } catch {}
-      }
-      return obj.summaries;
+      return {
+        summaries: obj.summaries,
+        files: Array.isArray(obj.files) ? obj.files : [],
+      };
     }
   } catch {}
 
@@ -367,10 +458,14 @@ export async function summarizeAllBatches(
   const groupCount = computeGroupCount(batches.length);
   const groups = splitIntoGroups(batches, groupCount);
 
-  // Summarize each group in parallel with retry logic
-  const groupResults = await Promise.all(
+  // Summarize each group in parallel with retry logic.
+  // Each group returns both the per-batch results AND its extracted file info,
+  // so we can merge files across parallel groups instead of relying on the
+  // global side-channel (which gets overwritten by whichever group finishes last).
+  const groupOutcomes = await Promise.all(
     groups.map(async (group, groupIdx) => {
-      let lastAttempt: Array<SummarizeResult | null> | null = null;
+      let lastResults: Array<SummarizeResult | null> | null = null;
+      let lastFiles: StructuredFileInfo[] = [];
 
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         if (attempt > 0) {
@@ -381,11 +476,12 @@ export async function summarizeAllBatches(
         }
 
         try {
-          const result = await summarizeGroup(group, config, ctx, batches, options);
-          lastAttempt = result;
+          const { results, files } = await processGroup(group, config, ctx, batches, options);
+          lastResults = results;
+          lastFiles = files;
           // Check if all batches in the group were successfully summarized
-          if (result.every((r) => r !== null)) {
-            return result;
+          if (results.every((r) => r !== null)) {
+            return { results, files };
           }
           // Partial success (some nulls) — retry
         } catch (err: any) {
@@ -403,17 +499,24 @@ export async function summarizeAllBatches(
         `pruner: group ${groupIdx + 1} failed after ${MAX_RETRIES} attempts — some summaries may be missing`,
         "error"
       );
-      return lastAttempt ?? group.map(() => null);
+      return { results: lastResults ?? group.map(() => null), files: lastFiles };
     })
   );
 
+  // Merge file knowledge from all groups
+  const allFiles: StructuredFileInfo[] = [];
+  for (const { files } of groupOutcomes) {
+    allFiles.push(...files);
+  }
+  _lastParsedFiles = allFiles;
+
   // Flatten group results into a single array aligned with the original batches
-  return groupResults.flat();
+  return groupOutcomes.flatMap(({ results }) => results);
 }
 
 /**
  * Summarize a group of batches in one structured JSON LLM call.
- * Returns an array of per-batch results aligned with the group.
+ * Returns both per-batch results and extracted file knowledge.
  */
 async function summarizeGroup(
   group: CapturedBatch[],
@@ -421,13 +524,13 @@ async function summarizeGroup(
   ctx: ExtensionContext,
   allBatches: CapturedBatch[],
   options: SummarizeBatchesOptions
-): Promise<Array<SummarizeResult | null>> {
+): Promise<GroupProcessResult> {
   const model = resolveModel(config, ctx);
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) {
     const authMessage = "error" in auth ? auth.error : "authentication failed";
     ctx.ui.notify(`pruner: summarization failed: ${authMessage}`, "error");
-    return group.map(() => null);
+    return { results: group.map(() => null), files: [] };
   }
 
   // Serialize all batches in the group with XML turn delimiters
@@ -482,18 +585,15 @@ async function summarizeGroup(
     .map((c: any) => c.text)
     .join("\n");
 
-  // Reset side channel before parsing
-  resetParsedFiles();
-
-  // Parse structured JSON
+  // Parse structured JSON — get both summaries and file knowledge from one call
   const parsed = tryParseStructuredJson(llmText);
-  if (!parsed || parsed.length === 0) {
+  if (!parsed || parsed.summaries.length === 0) {
     throw new Error(`structured summary returned no valid entries (${llmText.slice(0, 100)}...)`);
   }
 
   // Build a lookup map: turnIndex -> summaryText
   const summaryMap = new Map<number, string>();
-  for (const entry of parsed) {
+  for (const entry of parsed.summaries) {
     if (entry.turnIndex != null && entry.summaryText) {
       summaryMap.set(entry.turnIndex, entry.summaryText);
     }
@@ -541,5 +641,5 @@ async function summarizeGroup(
     });
   }
 
-  return results;
+  return { results, files: parsed.files };
 }

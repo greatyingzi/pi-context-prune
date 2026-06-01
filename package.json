@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "echo 'nothing to build'",
-    "check": "echo 'nothing to check'"
+    "check": "echo 'nothing to check'",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "pi-package"
@@ -31,9 +33,12 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.7"
   }
 }

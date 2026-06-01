@@ -65,6 +65,13 @@ export const STATUS_WIDGET_ID = "context-prune";
  */
 export const PROGRESS_WIDGET_ID = "context-prune-progress";
 
+/**
+ * Maximum estimated input characters for a single structured JSON LLM call.
+ * ~35k chars ≈ ~20k tokens, well below typical 32k context limits.
+ * Prevents OOM/failure when many large batches are combined in one group.
+ */
+export const MAX_STRUCTURED_INPUT_CHARS = 35000;
+
 /** Name of the context_prune tool (injected only when agentic-auto mode is active) */
 export const CONTEXT_PRUNE_TOOL_NAME = "context_prune";
 
